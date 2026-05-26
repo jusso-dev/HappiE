@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-heylo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-heylo}
+      POSTGRES_DB: ${POSTGRES_DB:-heylo}
+    ports:
+      - "0.0.0.0:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-heylo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "0.0.0.0:56379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "0.0.0.0:9000:9000"
+      - "0.0.0.0:9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      R2_BUCKET: ${R2_BUCKET:-heylo}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 2; done;
+      mc mb -p local/$${R2_BUCKET:-heylo} || true;
+      exit 0;
+      "
+
+  rust-api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://heylo:heylo@postgres:5432/heylo}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-dev-access-secret-change-me}
+      REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:-dev-refresh-secret-change-me}
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-owner@heylo.local}
+      ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-ChangeMe123!}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-minioadmin}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
+      R2_BUCKET: ${R2_BUCKET:-heylo}
+      R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-http://localhost:18080}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5500}
+      IMPORT_WORKER_TOKEN: ${IMPORT_WORKER_TOKEN:-dev-worker-token}
+      MAX_IMPORT_FILE_SIZE_MB: 2048
+      OPTIMIZED_VIDEO_PRESET: ${OPTIMIZED_VIDEO_PRESET:-medium}
+      APP_ENV: ${APP_ENV:-development}
+      RUST_LOG: info
+    ports:
+      - "0.0.0.0:18080:8080"
+
+  admin-web:
+    build:
+      context: .
+      dockerfile: apps/admin-web/Dockerfile
+    depends_on:
+      - rust-api
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:18080}
+    ports:
+      - "0.0.0.0:5500:3000"
+    volumes:
+      - ./apps/admin-web:/app/apps/admin-web
+      - admin-node-modules:/app/apps/admin-web/node_modules
+
+  import-worker:
+    build:
+      context: .
+      dockerfile: apps/import-worker/Dockerfile
+    depends_on:
+      - rust-api
+      - minio-init
+    environment:
+      PUBLIC_API_BASE_URL: http://rust-api:8080
+      IMPORT_WORKER_TOKEN: ${IMPORT_WORKER_TOKEN:-dev-worker-token}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-minioadmin}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
+      R2_BUCKET: ${R2_BUCKET:-heylo}
+      R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
+      MAX_IMPORT_FILE_SIZE_MB: 2048
+      MAX_CONCURRENT_IMPORTS: ${MAX_CONCURRENT_IMPORTS:-2}
+      YTDLP_CONCURRENT_FRAGMENTS: ${YTDLP_CONCURRENT_FRAGMENTS:-4}
+      OPTIMIZED_VIDEO_PRESET: ${OPTIMIZED_VIDEO_PRESET:-medium}
+    volumes:
+      - ./apps/import-worker:/app/apps/import-worker
+      - worker-node-modules:/app/apps/import-worker/node_modules
+
+volumes:
+  postgres-data:
+  minio-data:
+  admin-node-modules:
+  worker-node-modules:

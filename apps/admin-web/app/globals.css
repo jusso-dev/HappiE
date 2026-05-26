@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: oklch(96.4% 0.012 92);
+  color: oklch(24% 0.026 82);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+input, textarea, select {
+  @apply rounded-ui border border-border bg-panel px-3 py-2 text-sm text-ink outline-none transition placeholder:text-muted;
+  color: oklch(24% 0.026 82) !important;
+  background-color: oklch(99.2% 0.006 92) !important;
+  box-shadow: 0 1px 0 oklch(100% 0.004 92 / 0.75) inset;
+  color-scheme: light;
+}
+
+input:hover, textarea:hover, select:hover {
+  border-color: oklch(79% 0.032 92);
+}
+
+input:focus, textarea:focus, select:focus {
+  border-color: oklch(53% 0.13 154);
+  box-shadow: 0 0 0 3px oklch(53% 0.13 154 / 0.18), 0 1px 0 oklch(100% 0.004 92 / 0.75) inset;
+}
+
+input:not([type="checkbox"]):not([type="radio"]), textarea, select {
+  @apply block w-full;
+}
+
+input[type="checkbox"], input[type="radio"] {
+  @apply size-4 shrink-0 p-0 accent-accent;
+  box-shadow: none;
+}
+
+input:-webkit-autofill,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-text-fill-color: oklch(24% 0.026 82) !important;
+  box-shadow: 0 0 0 1000px oklch(99.2% 0.006 92) inset !important;
+}
+
+label {
+  @apply text-sm font-medium text-ink;
+}
+
+::selection {
+  background: oklch(84% 0.08 154);
+  color: oklch(23% 0.04 154);
+}
+
+@layer components {
+  .page-title {
+    @apply text-[1.55rem] font-semibold leading-tight tracking-normal text-ink;
+  }
+
+  .page-subtitle {
+    @apply mt-1 max-w-2xl text-sm leading-6 text-muted;
+  }
+
+  .soft-section {
+    @apply rounded-ui border border-border;
+    background: oklch(24% 0.026 82 / 0.025);
+  }
+}
