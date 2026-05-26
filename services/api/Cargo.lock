@@ -1340,6 +1340,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "happie-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "axum",
+ "chrono",
+ "dotenvy",
+ "jsonwebtoken",
+ "mime_guess",
+ "rand 0.8.6",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-swagger-ui",
+ "uuid",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1404,37 +1435,6 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
-name = "heylo-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "axum",
- "chrono",
- "dotenvy",
- "jsonwebtoken",
- "mime_guess",
- "rand 0.8.6",
- "redis",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "utoipa",
- "utoipa-swagger-ui",
- "uuid",
-]
 
 [[package]]
 name = "hkdf"

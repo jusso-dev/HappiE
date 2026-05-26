@@ -40,7 +40,7 @@ type YoutubeMediaInfo = {
   duration_seconds?: number;
 };
 
-const apiBase = process.env.PUBLIC_API_BASE_URL || "http://rust-api:8080";
+const apiBase = process.env.PUBLIC_API_BASE_URL || "http://happie-api:8080";
 const workerToken = process.env.IMPORT_WORKER_TOKEN || "dev-worker-token";
 const maxConcurrent = Number(process.env.MAX_CONCURRENT_IMPORTS || "2");
 const maxMb = Number(process.env.MAX_IMPORT_FILE_SIZE_MB || "2048");
@@ -50,7 +50,7 @@ const videoMaxHeight = Number(process.env.OPTIMIZED_VIDEO_MAX_HEIGHT || "720");
 const videoCrf = Number(process.env.OPTIMIZED_VIDEO_CRF || "26");
 const videoPreset = process.env.OPTIMIZED_VIDEO_PRESET || "medium";
 const audioBitrate = process.env.OPTIMIZED_AUDIO_BITRATE || "96k";
-const bucket = process.env.R2_BUCKET || "heylo";
+const bucket = process.env.R2_BUCKET || "happie";
 const streamedYoutubeFormat = "b[height<=720][ext=mp4][vcodec!=none][acodec!=none][protocol=https]/b[height<=720][vcodec!=none][acodec!=none][protocol=https]";
 
 const s3 = new S3Client({
@@ -351,7 +351,7 @@ async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, t
 }
 
 async function processJob(job: ImportJob) {
-  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `heylo-${job.id}-`));
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `happie-${job.id}-`));
   try {
     if (metadataString(job, "import_kind") === "playlist") {
       if (!job.source_url) throw new Error("playlist job has no source_url");

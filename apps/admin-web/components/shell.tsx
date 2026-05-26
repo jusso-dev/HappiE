@@ -27,7 +27,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <div className="mb-6 flex items-center gap-3 px-2">
           <div className="grid size-8 place-items-center rounded-ui bg-accent text-sm font-semibold text-panel">H</div>
           <div>
-            <div className="text-lg font-semibold tracking-normal">Heylo</div>
+            <div className="text-lg font-semibold tracking-normal">HappiE</div>
             <div className="text-xs text-muted">Family library admin</div>
           </div>
         </div>
@@ -55,7 +55,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <div className="flex h-14 items-center justify-between gap-3 px-4">
           <Link href="/dashboard" className="flex items-center gap-2 text-lg font-semibold tracking-normal">
             <span className="grid size-8 place-items-center rounded-ui bg-accent text-sm text-panel">H</span>
-            Heylo
+            HappiE
           </Link>
           <Button variant="secondary" className="h-8 px-2.5" onClick={signOut} aria-label="Sign out">
             <LogOut size={15} />

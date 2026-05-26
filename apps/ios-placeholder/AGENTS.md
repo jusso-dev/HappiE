@@ -1,6 +1,6 @@
-# Heylo SwiftUI iPad Agent Guide
+# HappiE SwiftUI iPad Agent Guide
 
-This guide is for agents building the future Heylo iPad app. Heylo is a private family video library for kids, controlled by parents. Do not build a public video platform, social feed, comments, public profiles, sharing, recommendations, or creator tools.
+This guide is for agents building the future HappiE iPad app. HappiE is a private family video library for kids, controlled by parents. Do not build a public video platform, social feed, comments, public profiles, sharing, recommendations, or creator tools.
 
 ## Product Scope
 
@@ -17,7 +17,7 @@ The iPad app must not talk directly to Postgres, Redis, R2, MinIO, or Cloudflare
 
 Use a small, testable SwiftUI architecture:
 
-- `HeyloApp`: app entry, dependency setup.
+- `HappiEApp`: app entry, dependency setup.
 - `AppState`: signed-in state, selected child profile, registered device, connectivity, sync status.
 - `APIClient`: typed HTTP client for the Rust API.
 - `AuthStore`: access token, refresh token, expiry handling, Keychain persistence.
@@ -30,7 +30,7 @@ Use a small, testable SwiftUI architecture:
 Prefer clear feature folders:
 
 ```text
-Heylo/
+HappiE/
   App/
   API/
   Auth/
@@ -52,7 +52,7 @@ Use a light theme by default. Avoid dark blue/slate dashboards, purple gradients
 Suggested color tokens, aligned with the admin app:
 
 ```swift
-enum HeyloColor {
+enum HappiEColor {
     // Use asset catalog colors with these OKLCH targets converted to Display P3 or sRGB.
     // Background: oklch(96% 0.008 235)
     // Panel:      oklch(98% 0.006 235)
@@ -358,7 +358,7 @@ When parent PIN endpoints are implemented, require PIN for parent area access af
 Child-facing errors should be short and nontechnical:
 
 - “This video is not available offline.”
-- “Ask a parent to sync Heylo.”
+- “Ask a parent to sync HappiE.”
 - “Download needs more space.”
 
 Parent-facing diagnostics can include:

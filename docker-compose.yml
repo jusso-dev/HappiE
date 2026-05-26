@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-heylo}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-heylo}
-      POSTGRES_DB: ${POSTGRES_DB:-heylo}
+      POSTGRES_USER: ${POSTGRES_USER:-happie}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-happie}
+      POSTGRES_DB: ${POSTGRES_DB:-happie}
     ports:
       - "0.0.0.0:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-heylo}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-happie}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -39,15 +39,15 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      R2_BUCKET: ${R2_BUCKET:-heylo}
+      R2_BUCKET: ${R2_BUCKET:-happie}
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin}; do sleep 2; done;
-      mc mb -p local/$${R2_BUCKET:-heylo} || true;
+      mc mb -p local/$${R2_BUCKET:-happie} || true;
       exit 0;
       "
 
-  rust-api:
+  happie-api:
     build:
       context: .
       dockerfile: services/api/Dockerfile
@@ -59,15 +59,15 @@ services:
       redis:
         condition: service_started
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://heylo:heylo@postgres:5432/heylo}
+      DATABASE_URL: ${DATABASE_URL:-postgres://happie:happie@postgres:5432/happie}
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-dev-access-secret-change-me}
       REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:-dev-refresh-secret-change-me}
-      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-owner@heylo.local}
+      ADMIN_BOOTSTRAP_EMAIL: ${ADMIN_BOOTSTRAP_EMAIL:-owner@happie.local}
       ADMIN_BOOTSTRAP_PASSWORD: ${ADMIN_BOOTSTRAP_PASSWORD:-ChangeMe123!}
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-minioadmin}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
-      R2_BUCKET: ${R2_BUCKET:-heylo}
+      R2_BUCKET: ${R2_BUCKET:-happie}
       R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
       PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-http://localhost:18080}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5500}
@@ -84,7 +84,7 @@ services:
       context: .
       dockerfile: apps/admin-web/Dockerfile
     depends_on:
-      - rust-api
+      - happie-api
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:18080}
     ports:
@@ -98,14 +98,14 @@ services:
       context: .
       dockerfile: apps/import-worker/Dockerfile
     depends_on:
-      - rust-api
+      - happie-api
       - minio-init
     environment:
-      PUBLIC_API_BASE_URL: http://rust-api:8080
+      PUBLIC_API_BASE_URL: http://happie-api:8080
       IMPORT_WORKER_TOKEN: ${IMPORT_WORKER_TOKEN:-dev-worker-token}
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-minioadmin}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
-      R2_BUCKET: ${R2_BUCKET:-heylo}
+      R2_BUCKET: ${R2_BUCKET:-happie}
       R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
       MAX_IMPORT_FILE_SIZE_MB: 2048
       MAX_CONCURRENT_IMPORTS: ${MAX_CONCURRENT_IMPORTS:-2}

@@ -1,10 +1,10 @@
-# Heylo
+# HappiE
 
 <p align="center">
   <img src="docs/assets/happie-app-icon.png" alt="HappiE app icon" width="128" height="128">
 </p>
 
-Heylo is a private, parent-controlled family video library for kids. It is not a public YouTube clone. Parents can upload videos, create child profiles, assign approved videos, and prepare an iPad client to stream or download optimized videos for offline viewing.
+HappiE is a private, parent-controlled family video library for kids. It is not a public YouTube clone. Parents can upload videos, create child profiles, assign approved videos, and prepare an iPad client to stream or download optimized videos for offline viewing.
 
 ## Public Release Status
 
@@ -18,7 +18,7 @@ This repository is designed to be safe to publish without local secrets. Keep th
 ## Architecture
 
 - `services/api`: Rust Axum API. This is the authoritative layer for auth, business rules, storage signing, metadata, imports, and sync.
-- `apps/admin-web`: Next.js App Router admin UI. It only calls the Rust API.
+- `apps/admin-web`: Next.js App Router admin UI. It only calls the HappiE API.
 - `apps/import-worker`: TypeScript worker using `yt-dlp` and FFmpeg inside Docker.
 - `apps/ios-placeholder`: SwiftUI readiness notes. The iPad app is not implemented yet.
 - `infra/migrations`: SQLx Postgres migrations.
@@ -34,13 +34,13 @@ docker compose up --build
 Services:
 
 - Admin UI: http://localhost:5500
-- Rust API: http://localhost:18080
+- HappiE API: http://localhost:18080
 - OpenAPI docs: http://localhost:18080/docs
 - MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin`)
 
 Bootstrap login:
 
-- Email: `owner@heylo.local`
+- Email: `owner@happie.local`
 - Password: the value of `ADMIN_BOOTSTRAP_PASSWORD` in your `.env`
 
 Change all secrets in `.env` before using non-local data. Do not commit `.env`.

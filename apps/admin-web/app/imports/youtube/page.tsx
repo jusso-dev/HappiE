@@ -81,7 +81,7 @@ export default function YoutubeImportPage() {
       <p className="page-subtitle mb-6">Import one video, or queue every video from a playlist you are permitted to store.</p>
       <div className="mb-6 flex gap-3 rounded-ui border border-warn/35 bg-warn/10 p-4 text-sm text-ink">
         <AlertTriangle size={18} className="mt-0.5 shrink-0" />
-        <p>You are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law. Heylo is a private family media library, not a public video sharing service.</p>
+        <p>You are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law. HappiE is a private family media library, not a public video sharing service.</p>
       </div>
       <div className="grid gap-6 lg:grid-cols-2">
         <Panel>

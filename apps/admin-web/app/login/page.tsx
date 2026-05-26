@@ -35,7 +35,7 @@ export default function LoginPage() {
         <div className="mb-6 flex items-center gap-3">
           <div className="grid size-10 place-items-center rounded-ui bg-accent text-panel"><Lock size={18} /></div>
           <div>
-            <h1 className="text-xl font-semibold">Heylo admin</h1>
+            <h1 className="text-xl font-semibold">HappiE admin</h1>
             <p className="text-sm text-muted">Private family library controls.</p>
           </div>
         </div>

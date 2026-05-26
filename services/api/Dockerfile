@@ -8,5 +8,5 @@ RUN cd services/api && cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/services/api/target/release/heylo-api /usr/local/bin/heylo-api
-CMD ["heylo-api"]
+COPY --from=builder /app/services/api/target/release/happie-api /usr/local/bin/happie-api
+CMD ["happie-api"]

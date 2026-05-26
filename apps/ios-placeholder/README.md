@@ -1,4 +1,4 @@
-# Heylo iPad Client Placeholder
+# HappiE iPad Client Placeholder
 
 The SwiftUI iPad client is intentionally not implemented yet.
 

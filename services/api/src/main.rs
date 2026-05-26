@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr: SocketAddr = "0.0.0.0:8080".parse()?;
-    tracing::info!("heylo api listening on {addr}");
+    tracing::info!("happie api listening on {addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
@@ -309,10 +309,10 @@ fn allowed_origins() -> Vec<HeaderValue> {
 
 async fn build_storage() -> anyhow::Result<Storage> {
     let endpoint = env::var("R2_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".into());
-    let bucket = env::var("R2_BUCKET").unwrap_or_else(|_| "heylo".into());
+    let bucket = env::var("R2_BUCKET").unwrap_or_else(|_| "happie".into());
     let access_key = env::var("R2_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".into());
     let secret = env::var("R2_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
-    let creds = Credentials::new(access_key, secret, None, None, "heylo-env");
+    let creds = Credentials::new(access_key, secret, None, None, "happie-env");
     let base = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new("auto"))
         .credentials_provider(creds)
@@ -330,7 +330,7 @@ async fn build_storage() -> anyhow::Result<Storage> {
 }
 
 async fn seed_admin(db: &PgPool) -> anyhow::Result<()> {
-    let email = env::var("ADMIN_BOOTSTRAP_EMAIL").unwrap_or_else(|_| "owner@heylo.local".into());
+    let email = env::var("ADMIN_BOOTSTRAP_EMAIL").unwrap_or_else(|_| "owner@happie.local".into());
     let password = env::var("ADMIN_BOOTSTRAP_PASSWORD").unwrap_or_else(|_| "ChangeMe123!".into());
     let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(&email)
@@ -417,7 +417,7 @@ async fn audit(
 
 #[utoipa::path(get, path = "/health")]
 async fn health() -> Json<Value> {
-    Json(json!({"ok": true, "service": "heylo-api"}))
+    Json(json!({"ok": true, "service": "happie-api"}))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1159,7 +1159,7 @@ async fn presign_upload(
     _user: AuthedUser,
     Json(_req): Json<PresignRequest>,
 ) -> ApiResult<Json<Value>> {
-    Err(err("presigned raw uploads are disabled; use /uploads/direct so Heylo stores only optimized media"))
+    Err(err("presigned raw uploads are disabled; use /uploads/direct so HappiE stores only optimized media"))
 }
 
 #[derive(Deserialize)]
@@ -1177,7 +1177,7 @@ async fn complete_upload(
     _user: AuthedUser,
     Json(_req): Json<CompleteUploadRequest>,
 ) -> ApiResult<Json<Value>> {
-    Err(err("raw upload completion is disabled; use /uploads/direct so Heylo stores only optimized media"))
+    Err(err("raw upload completion is disabled; use /uploads/direct so HappiE stores only optimized media"))
 }
 
 async fn direct_upload(
@@ -1308,7 +1308,7 @@ async fn optimize_uploaded_video(
     filename: &str,
 ) -> ApiResult<(String, String, i64, String, i64)> {
     let upload_id = Uuid::new_v4();
-    let work_dir = env::temp_dir().join(format!("heylo-upload-{upload_id}"));
+    let work_dir = env::temp_dir().join(format!("happie-upload-{upload_id}"));
     fs::create_dir_all(&work_dir)
         .await
         .map_err(|e| err(e.to_string()))?;

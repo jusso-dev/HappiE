@@ -4,12 +4,12 @@ export type ApiError = { error: string };
 
 export function getToken() {
   if (typeof window === "undefined") return "";
-  return localStorage.getItem("heylo_access_token") || "";
+  return localStorage.getItem("happie_access_token") || "";
 }
 
 export function setTokens(access: string, refresh: string) {
-  localStorage.setItem("heylo_access_token", access);
-  localStorage.setItem("heylo_refresh_token", refresh);
+  localStorage.setItem("happie_access_token", access);
+  localStorage.setItem("happie_refresh_token", refresh);
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -28,8 +28,8 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   if (!res.ok) {
     const body = (await res.json().catch(() => ({ error: res.statusText }))) as ApiError;
     if (res.status === 401 || body.error === "missing bearer token") {
-      localStorage.removeItem("heylo_access_token");
-      localStorage.removeItem("heylo_refresh_token");
+      localStorage.removeItem("happie_access_token");
+      localStorage.removeItem("happie_refresh_token");
       if (typeof window !== "undefined" && window.location.pathname !== "/login") {
         window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
       }
