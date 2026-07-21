@@ -8,19 +8,18 @@ Build a SwiftUI iPad client for children to watch and download parent-approved v
 
 Primary users:
 
-- Parent/admin: signs in, registers the device, selects the child profile, unlocks protected settings with a parent PIN when that API exists.
+- Parent/admin: registers the device, selects the child profile, and unlocks protected settings with a local parent PIN when that feature exists.
 - Child: browses assigned videos, watches videos, downloads permitted videos for offline use, resumes progress.
 
-The iPad app must not talk directly to Postgres, Redis, R2, MinIO, or Cloudflare. All reads, writes, storage URLs, sync manifests, and auth flows must go through the Rust API.
+The iPad app must not talk directly to Postgres, R2, MinIO, or Cloudflare. All reads, writes, storage URLs, and sync manifests must go through the Rust API.
 
 ## Architecture
 
 Use a small, testable SwiftUI architecture:
 
 - `HappiEApp`: app entry, dependency setup.
-- `AppState`: signed-in state, selected child profile, registered device, connectivity, sync status.
+- `AppState`: selected child profile, registered device, connectivity, sync status.
 - `APIClient`: typed HTTP client for the Rust API.
-- `AuthStore`: access token, refresh token, expiry handling, Keychain persistence.
 - `DeviceStore`: registered device id and selected child id, Keychain or protected app storage.
 - `LibraryStore`: assigned videos, asset versions, local file paths, manifest expiry.
 - `DownloadManager`: URLSession background downloads, quota enforcement, retry and cleanup.
@@ -33,7 +32,6 @@ Prefer clear feature folders:
 HappiE/
   App/
   API/
-  Auth/
   Device/
   Library/
   Downloads/
@@ -87,32 +85,18 @@ Interaction guidelines:
 - Use familiar SF Symbols for download, play, pause, refresh, settings, lock, child profile, and storage.
 - Do not show technical text to children. Technical errors belong in parent/admin settings.
 
-## Auth Pattern
+## Local API Access
 
-Current backend supports admin login and refresh tokens:
-
-- `POST /auth/login`
-- `POST /auth/refresh`
-- `GET /me`
-
-Implementation requirements:
-
-- Store access and refresh tokens in Keychain.
-- Treat access tokens as short-lived.
-- Refresh automatically on `401` once, then retry the original request.
-- If refresh fails, return to parent login.
-- Never log tokens, signed URLs, passwords, or refresh token values.
-- Do not store parent password.
-- Future parent PIN support should unlock local parent controls and, when backend endpoints exist, verify/update `parent_pin_hash` through the API.
+The backend intentionally has no login, access token, refresh token, role gate, or device credential. Send normal HTTP requests without an `Authorization` header.
 
 Recommended client flow:
 
-1. Parent signs in with email/password.
-2. Store `access_token` and `refresh_token` in Keychain.
-3. Call `GET /me`.
-4. Register or load this iPad device.
-5. Select child profile.
-6. Sync assigned library.
+1. Connect to the configured HappiE API on the trusted LAN.
+2. Register or load this iPad device.
+3. Select a child profile.
+4. Sync the assigned library.
+
+A future parent PIN should protect local parent controls on the device; do not treat it as network authentication unless the backend contract explicitly changes.
 
 ## API Base URL
 
@@ -120,19 +104,13 @@ Use configurable API environments:
 
 - Local simulator: `http://localhost:18080`
 - Local physical iPad: use the Mac LAN IP, for example `http://192.168.1.20:18080`
-- Production: HTTPS API origin only.
+- Trusted LAN installation: the configured local API origin.
 
-Do not hardcode production secrets or tokens in the app.
+Do not hardcode database or object-storage credentials in the app.
 
 ## Core API Endpoints
 
 Use these existing endpoints.
-
-Auth:
-
-- `POST /auth/login`
-- `POST /auth/refresh`
-- `GET /me`
 
 Children:
 
@@ -163,11 +141,6 @@ Uploads/imports/admin-only endpoints exist but should not be exposed to children
 Mirror backend JSON defensively. Dates are ISO 8601 strings.
 
 ```swift
-struct TokenResponse: Decodable {
-    let accessToken: String
-    let refreshToken: String
-}
-
 struct ChildProfile: Identifiable, Decodable {
     let id: UUID
     let name: String
@@ -239,7 +212,7 @@ Persist returned device id. If the selected child changes, update support may ne
 
 ## Child Selection
 
-Parent selects one child profile for the device. Show a parent-facing child picker after login and before the child library.
+Parent selects one child profile for the device. Show a parent-facing child picker before the child library.
 
 Acceptance behavior:
 
@@ -343,7 +316,6 @@ Queue progress locally when offline and flush after connectivity returns.
 
 The child app should include a parent-only area for:
 
-- Login/logout.
 - Device registration status.
 - Child profile selection.
 - Storage quota and downloaded videos.
@@ -351,7 +323,7 @@ The child app should include a parent-only area for:
 - API environment in debug builds.
 - Legal/import note: YouTube imports are user-supplied content controlled in the admin UI; the iPad app must not provide YouTube search/import.
 
-When parent PIN endpoints are implemented, require PIN for parent area access after initial login.
+When parent PIN support is implemented, require the PIN for local parent-area access.
 
 ## Error Handling
 
@@ -369,13 +341,13 @@ Parent-facing diagnostics can include:
 - Download failures.
 - Device id.
 
-Never show raw tokens, signed URLs, stack traces, or storage keys.
+Never show signed URLs, stack traces, or storage keys.
 
 ## Testing Expectations
 
 Add tests around:
 
-- Token refresh and retry on `401`.
+- Credential-free API requests against the configured LAN base URL.
 - JSON decoding for sync manifests.
 - Download priority ordering.
 - Quota eviction logic.
@@ -390,7 +362,6 @@ Do not invent client-only behavior that conflicts with the API.
 
 Known follow-ups:
 
-- Dedicated child/device auth may replace admin JWTs for the iPad.
 - Parent PIN management endpoints are not implemented yet.
 - Device child-profile update endpoint is not implemented yet.
 - HLS processing is planned but not active.

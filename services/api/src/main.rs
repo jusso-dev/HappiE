@@ -1,9 +1,5 @@
 use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
@@ -11,19 +7,15 @@ use aws_sdk_s3::{
     Client as S3Client,
 };
 use axum::{
-    async_trait,
     extract::{Multipart, Path, State},
-    http::{header, request::Parts, HeaderMap, HeaderValue, Method, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, Column, PgPool, Row};
 use tokio::{fs, process::Command};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -35,9 +27,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
-    jwt_secret: String,
-    refresh_secret: String,
-    worker_token: String,
     s3: Storage,
 }
 
@@ -61,82 +50,18 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
-struct Claims {
-    sub: Uuid,
-    role: String,
-    exp: usize,
-}
-
-#[derive(Debug, Clone)]
-struct AuthedUser {
-    id: Uuid,
-    role: String,
-}
-
-#[async_trait]
-impl axum::extract::FromRequestParts<AppState> for AuthedUser {
-    type Rejection = (StatusCode, Json<ApiError>);
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("missing bearer token"))?;
-        let data = decode::<Claims>(
-            token,
-            &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
-            &Validation::default(),
-        )
-        .map_err(|_| unauthorized("invalid token"))?;
-        Ok(Self {
-            id: data.claims.sub,
-            role: data.claims.role,
-        })
-    }
-}
-
-fn unauthorized(msg: &str) -> (StatusCode, Json<ApiError>) {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(ApiError {
-            error: msg.to_string(),
-        }),
-    )
-}
-
 fn err(msg: impl Into<String>) -> ApiError {
     ApiError { error: msg.into() }
-}
-
-fn require_owner(user: &AuthedUser) -> ApiResult<()> {
-    if user.role == "owner" {
-        Ok(())
-    } else {
-        Err(err("owner access required"))
-    }
 }
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
         health,
-        login,
-        refresh,
-        me,
         list_children,
         create_child,
         update_child,
         delete_child,
-        list_users,
-        create_user,
-        update_user,
-        delete_user,
         list_videos,
         create_video,
         update_video,
@@ -161,16 +86,7 @@ fn require_owner(user: &AuthedUser) -> ApiResult<()> {
         update_category,
         delete_category
     ),
-    components(schemas(
-        LoginRequest,
-        TokenResponse,
-        UserInput,
-        UserUpdateInput,
-        ChildInput,
-        VideoInput,
-        CategoryInput,
-        AssignRequest
-    ))
+    components(schemas(ChildInput, VideoInput, CategoryInput, AssignRequest))
 )]
 struct ApiDoc;
 
@@ -190,37 +106,16 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
     sqlx::migrate!("../../infra/migrations").run(&db).await?;
-    seed_admin(&db).await?;
-
-    validate_runtime_config()?;
 
     let state = AppState {
         db,
-        jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "dev-access-secret-change-me".into()),
-        refresh_secret: env::var("REFRESH_TOKEN_SECRET")
-            .unwrap_or_else(|_| "dev-refresh-secret-change-me".into()),
-        worker_token: env::var("IMPORT_WORKER_TOKEN").unwrap_or_else(|_| "dev-worker-token".into()),
         s3: build_storage().await?,
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(allowed_origins())
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    let cors = CorsLayer::permissive();
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/auth/login", post(login))
-        .route("/auth/refresh", post(refresh))
-        .route("/me", get(me))
-        .route("/users", get(list_users).post(create_user))
-        .route("/users/:id", put(update_user).delete(delete_user))
         .route("/children", get(list_children).post(create_child))
         .route("/children/:id", put(update_child).delete(delete_child))
         .route("/children/:id/library", get(child_library))
@@ -268,45 +163,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_runtime_config() -> anyhow::Result<()> {
-    if env::var("APP_ENV").unwrap_or_default() != "production" {
-        return Ok(());
-    }
-
-    let unsafe_values = [
-        ("JWT_SECRET", "dev-access-secret-change-me"),
-        ("REFRESH_TOKEN_SECRET", "dev-refresh-secret-change-me"),
-        ("IMPORT_WORKER_TOKEN", "dev-worker-token"),
-        ("ADMIN_BOOTSTRAP_PASSWORD", "ChangeMe123!"),
-    ];
-
-    for (name, unsafe_value) in unsafe_values {
-        let value = env::var(name).unwrap_or_default();
-        if value.is_empty() || value == unsafe_value || value.len() < 24 {
-            anyhow::bail!(
-                "{name} must be set to a strong non-default value when APP_ENV=production"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn allowed_origins() -> Vec<HeaderValue> {
-    env::var("ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5500".into())
-        .split(',')
-        .filter_map(|origin| {
-            let trimmed = origin.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                trimmed.parse().ok()
-            }
-        })
-        .collect()
-}
-
 async fn build_storage() -> anyhow::Result<Storage> {
     let endpoint = env::var("R2_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".into());
     let bucket = env::var("R2_BUCKET").unwrap_or_else(|_| "happie".into());
@@ -329,84 +185,10 @@ async fn build_storage() -> anyhow::Result<Storage> {
     })
 }
 
-async fn seed_admin(db: &PgPool) -> anyhow::Result<()> {
-    let email = env::var("ADMIN_BOOTSTRAP_EMAIL").unwrap_or_else(|_| "owner@happie.local".into());
-    let password = env::var("ADMIN_BOOTSTRAP_PASSWORD").unwrap_or_else(|_| "ChangeMe123!".into());
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
-        .bind(&email)
-        .fetch_optional(db)
-        .await?;
-    if exists.is_none() {
-        let hash = hash_password(&password)?;
-        sqlx::query("INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'owner')")
-            .bind(email)
-            .bind(hash)
-            .execute(db)
-            .await?;
-    }
-    Ok(())
-}
-
-fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .to_string())
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash)
-        .ok()
-        .and_then(|parsed| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .ok()
-        })
-        .is_some()
-}
-
-fn issue_access(state: &AppState, user_id: Uuid, role: &str) -> ApiResult<String> {
-    let claims = Claims {
-        sub: user_id,
-        role: role.to_string(),
-        exp: (Utc::now() + ChronoDuration::minutes(30)).timestamp() as usize,
-    };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )
-    .map_err(|_| err("failed to sign token"))
-}
-
-fn random_token() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(64)
-        .map(char::from)
-        .collect()
-}
-
-fn token_hash(secret: &str, token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-async fn audit(
-    db: &PgPool,
-    actor: Option<Uuid>,
-    action: &str,
-    entity: &str,
-    entity_id: Option<Uuid>,
-    metadata: Value,
-) {
+async fn audit(db: &PgPool, action: &str, entity: &str, entity_id: Option<Uuid>, metadata: Value) {
     let _ = sqlx::query(
-        "INSERT INTO audit_logs (actor_user_id, action, entity_type, entity_id, metadata) VALUES ($1,$2,$3,$4,$5)",
+        "INSERT INTO audit_logs (actor, action, entity_type, entity_id, metadata) VALUES ('local_api',$1,$2,$3,$4)",
     )
-    .bind(actor)
     .bind(action)
     .bind(entity)
     .bind(entity_id)
@@ -421,255 +203,6 @@ async fn health() -> Json<Value> {
 }
 
 #[derive(Deserialize, ToSchema)]
-struct LoginRequest {
-    email: String,
-    password: String,
-}
-
-#[derive(Serialize, ToSchema)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-}
-
-#[utoipa::path(post, path = "/auth/login", request_body = LoginRequest)]
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> ApiResult<Json<TokenResponse>> {
-    let row =
-        sqlx::query("SELECT id, password_hash, role FROM users WHERE lower(email) = lower($1)")
-            .bind(req.email.trim())
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|_| err("login failed"))?
-            .ok_or_else(|| err("invalid credentials"))?;
-    let id: Uuid = row.get("id");
-    let password_hash: String = row.get("password_hash");
-    let role: String = row.get("role");
-    if !verify_password(&req.password, &password_hash) {
-        return Err(err("invalid credentials"));
-    }
-    let access_token = issue_access(&state, id, &role)?;
-    let refresh_token = random_token();
-    let hash = token_hash(&state.refresh_secret, &refresh_token);
-    sqlx::query("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1,$2,$3)")
-        .bind(id)
-        .bind(hash)
-        .bind(Utc::now() + ChronoDuration::days(30))
-        .execute(&state.db)
-        .await
-        .map_err(|_| err("failed to persist refresh token"))?;
-    audit(&state.db, Some(id), "login", "user", Some(id), json!({})).await;
-    Ok(Json(TokenResponse {
-        access_token,
-        refresh_token,
-    }))
-}
-
-#[derive(Deserialize)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
-#[utoipa::path(post, path = "/auth/refresh")]
-async fn refresh(
-    State(state): State<AppState>,
-    Json(req): Json<RefreshRequest>,
-) -> ApiResult<Json<TokenResponse>> {
-    let hash = token_hash(&state.refresh_secret, &req.refresh_token);
-    let row = sqlx::query(
-        "SELECT rt.user_id, u.role FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id WHERE rt.token_hash = $1 AND rt.revoked_at IS NULL AND rt.expires_at > now()",
-    )
-    .bind(hash)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| err("refresh failed"))?
-    .ok_or_else(|| err("invalid refresh token"))?;
-    let user_id: Uuid = row.get("user_id");
-    let role: String = row.get("role");
-    let refresh_token = random_token();
-    let new_hash = token_hash(&state.refresh_secret, &refresh_token);
-    sqlx::query("UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1")
-        .bind(token_hash(&state.refresh_secret, &req.refresh_token))
-        .execute(&state.db)
-        .await
-        .ok();
-    sqlx::query("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1,$2,$3)")
-        .bind(user_id)
-        .bind(new_hash)
-        .bind(Utc::now() + ChronoDuration::days(30))
-        .execute(&state.db)
-        .await
-        .map_err(|_| err("failed to persist refresh token"))?;
-    Ok(Json(TokenResponse {
-        access_token: issue_access(&state, user_id, &role)?,
-        refresh_token,
-    }))
-}
-
-#[utoipa::path(get, path = "/me")]
-async fn me(State(state): State<AppState>, user: AuthedUser) -> ApiResult<Json<Value>> {
-    let row = sqlx::query("SELECT id, email, role, created_at FROM users WHERE id = $1")
-        .bind(user.id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| err("user not found"))?;
-    Ok(Json(
-        json!({"id": row.get::<Uuid,_>("id"), "email": row.get::<String,_>("email"), "role": row.get::<String,_>("role"), "created_at": row.get::<DateTime<Utc>,_>("created_at")}),
-    ))
-}
-
-#[derive(Deserialize, ToSchema)]
-struct UserInput {
-    email: String,
-    password: String,
-    role: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-struct UserUpdateInput {
-    email: String,
-    password: Option<String>,
-    role: String,
-}
-
-fn validate_user_role(role: &str) -> ApiResult<&str> {
-    match role {
-        "owner" | "admin" | "viewer" => Ok(role),
-        _ => Err(err("role must be owner, admin, or viewer")),
-    }
-}
-
-#[utoipa::path(get, path = "/users")]
-async fn list_users(State(state): State<AppState>, user: AuthedUser) -> ApiResult<Json<Value>> {
-    require_owner(&user)?;
-    rows_json(
-        sqlx::query(
-            "SELECT id, email, role, created_at, updated_at FROM users ORDER BY created_at",
-        )
-        .fetch_all(&state.db)
-        .await,
-    )
-}
-
-#[utoipa::path(post, path = "/users", request_body = UserInput)]
-async fn create_user(
-    State(state): State<AppState>,
-    user: AuthedUser,
-    Json(req): Json<UserInput>,
-) -> ApiResult<Json<Value>> {
-    require_owner(&user)?;
-    let email = req.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(err("valid email is required"));
-    }
-    if req.password.len() < 10 {
-        return Err(err("password must be at least 10 characters"));
-    }
-    let role = validate_user_role(req.role.as_str())?;
-    let hash = hash_password(&req.password).map_err(|_| err("failed to hash password"))?;
-    let row = sqlx::query("INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, created_at, updated_at")
-        .bind(email)
-        .bind(hash)
-        .bind(role)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| err("email is already in use"))?;
-    let id: Uuid = row.get("id");
-    audit(
-        &state.db,
-        Some(user.id),
-        "create",
-        "user",
-        Some(id),
-        json!({"role": role}),
-    )
-    .await;
-    Ok(Json(row_to_json(&row)))
-}
-
-#[utoipa::path(put, path = "/users/{id}", request_body = UserUpdateInput)]
-async fn update_user(
-    State(state): State<AppState>,
-    user: AuthedUser,
-    Path(id): Path<Uuid>,
-    Json(req): Json<UserUpdateInput>,
-) -> ApiResult<Json<Value>> {
-    require_owner(&user)?;
-    let email = req.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(err("valid email is required"));
-    }
-    let role = validate_user_role(req.role.as_str())?;
-    if user.id == id && role != "owner" {
-        return Err(err("you cannot remove your own owner role"));
-    }
-
-    let row = if let Some(password) = req.password.filter(|value| !value.is_empty()) {
-        if password.len() < 10 {
-            return Err(err("password must be at least 10 characters"));
-        }
-        let hash = hash_password(&password).map_err(|_| err("failed to hash password"))?;
-        sqlx::query("UPDATE users SET email=$1, password_hash=$2, role=$3, updated_at=now() WHERE id=$4 RETURNING id, email, role, created_at, updated_at")
-            .bind(email)
-            .bind(hash)
-            .bind(role)
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-    } else {
-        sqlx::query("UPDATE users SET email=$1, role=$2, updated_at=now() WHERE id=$3 RETURNING id, email, role, created_at, updated_at")
-            .bind(email)
-            .bind(role)
-            .bind(id)
-            .fetch_one(&state.db)
-            .await
-    }
-    .map_err(|_| err("user not found or email is already in use"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "edit",
-        "user",
-        Some(id),
-        json!({"role": role}),
-    )
-    .await;
-    Ok(Json(row_to_json(&row)))
-}
-
-#[utoipa::path(delete, path = "/users/{id}")]
-async fn delete_user(
-    State(state): State<AppState>,
-    user: AuthedUser,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
-    require_owner(&user)?;
-    if user.id == id {
-        return Err(err("you cannot delete your own account"));
-    }
-    let result = sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|_| err("delete failed"))?;
-    if result.rows_affected() == 0 {
-        return Err(err("user not found"));
-    }
-    audit(
-        &state.db,
-        Some(user.id),
-        "delete",
-        "user",
-        Some(id),
-        json!({}),
-    )
-    .await;
-    Ok(Json(json!({"ok": true})))
-}
-
-#[derive(Deserialize, ToSchema)]
 struct ChildInput {
     name: String,
     avatar_color: Option<String>,
@@ -678,7 +211,7 @@ struct ChildInput {
 }
 
 #[utoipa::path(get, path = "/children")]
-async fn list_children(State(state): State<AppState>, _user: AuthedUser) -> ApiResult<Json<Value>> {
+async fn list_children(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     rows_json(
         sqlx::query("SELECT * FROM child_profiles WHERE is_active = true ORDER BY created_at")
             .fetch_all(&state.db)
@@ -689,7 +222,6 @@ async fn list_children(State(state): State<AppState>, _user: AuthedUser) -> ApiR
 #[utoipa::path(post, path = "/children", request_body = ChildInput)]
 async fn create_child(
     State(state): State<AppState>,
-    user: AuthedUser,
     Json(req): Json<ChildInput>,
 ) -> ApiResult<Json<Value>> {
     if req.name.trim().is_empty() {
@@ -699,44 +231,26 @@ async fn create_child(
         .bind(req.name.trim()).bind(req.avatar_color).bind(req.birth_year).bind(req.storage_quota_mb.unwrap_or(8192))
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
     let id: Uuid = row.get("id");
-    audit(
-        &state.db,
-        Some(user.id),
-        "create",
-        "child_profile",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "create", "child_profile", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 #[utoipa::path(put, path = "/children/{id}", request_body = ChildInput)]
 async fn update_child(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<ChildInput>,
 ) -> ApiResult<Json<Value>> {
     let row = sqlx::query("UPDATE child_profiles SET name=$1, avatar_color=$2, birth_year=$3, storage_quota_mb=$4, updated_at=now() WHERE id=$5 RETURNING *")
         .bind(req.name.trim()).bind(req.avatar_color).bind(req.birth_year).bind(req.storage_quota_mb.unwrap_or(8192)).bind(id)
         .fetch_one(&state.db).await.map_err(|_| err("child not found"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "edit",
-        "child_profile",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "edit", "child_profile", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 #[utoipa::path(delete, path = "/children/{id}")]
 async fn delete_child(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("UPDATE child_profiles SET is_active=false, updated_at=now() WHERE id=$1")
@@ -744,15 +258,7 @@ async fn delete_child(
         .execute(&state.db)
         .await
         .map_err(|_| err("delete failed"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "delete",
-        "child_profile",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "delete", "child_profile", Some(id), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -763,10 +269,7 @@ struct CategoryInput {
 }
 
 #[utoipa::path(get, path = "/categories")]
-async fn list_categories(
-    State(state): State<AppState>,
-    _user: AuthedUser,
-) -> ApiResult<Json<Value>> {
+async fn list_categories(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     rows_json(
         sqlx::query("SELECT * FROM categories ORDER BY name")
             .fetch_all(&state.db)
@@ -777,7 +280,6 @@ async fn list_categories(
 #[utoipa::path(post, path = "/categories", request_body = CategoryInput)]
 async fn create_category(
     State(state): State<AppState>,
-    user: AuthedUser,
     Json(req): Json<CategoryInput>,
 ) -> ApiResult<Json<Value>> {
     let row = sqlx::query("INSERT INTO categories (name, color) VALUES ($1,$2) RETURNING *")
@@ -788,7 +290,6 @@ async fn create_category(
         .map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
-        Some(user.id),
         "create",
         "category",
         Some(row.get("id")),
@@ -801,7 +302,6 @@ async fn create_category(
 #[utoipa::path(put, path = "/categories/{id}", request_body = CategoryInput)]
 async fn update_category(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<CategoryInput>,
 ) -> ApiResult<Json<Value>> {
@@ -812,22 +312,13 @@ async fn update_category(
         .fetch_one(&state.db)
         .await
         .map_err(|_| err("category not found"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "edit",
-        "category",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "edit", "category", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 #[utoipa::path(delete, path = "/categories/{id}")]
 async fn delete_category(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("DELETE FROM categories WHERE id=$1")
@@ -835,15 +326,7 @@ async fn delete_category(
         .execute(&state.db)
         .await
         .map_err(|_| err("delete failed"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "delete",
-        "category",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "delete", "category", Some(id), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -860,7 +343,7 @@ struct VideoInput {
 }
 
 #[utoipa::path(get, path = "/videos")]
-async fn list_videos(State(state): State<AppState>, _user: AuthedUser) -> ApiResult<Json<Value>> {
+async fn list_videos(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let rows = sqlx::query("SELECT v.*, c.name AS category_name, COALESCE(SUM(a.file_size_bytes), 0)::bigint AS storage_bytes FROM videos v LEFT JOIN categories c ON c.id=v.category_id LEFT JOIN video_assets a ON a.video_id=v.id GROUP BY v.id, c.name ORDER BY v.created_at DESC")
         .fetch_all(&state.db).await.map_err(|e| err(e.to_string()))?;
     let mut videos = Vec::new();
@@ -870,11 +353,7 @@ async fn list_videos(State(state): State<AppState>, _user: AuthedUser) -> ApiRes
     Ok(Json(Value::Array(videos)))
 }
 
-async fn get_video(
-    State(state): State<AppState>,
-    _user: AuthedUser,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+async fn get_video(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     let row = sqlx::query("SELECT * FROM videos WHERE id=$1")
         .bind(id)
         .fetch_one(&state.db)
@@ -886,33 +365,23 @@ async fn get_video(
 #[utoipa::path(post, path = "/videos", request_body = VideoInput)]
 async fn create_video(
     State(state): State<AppState>,
-    user: AuthedUser,
     Json(req): Json<VideoInput>,
 ) -> ApiResult<Json<Value>> {
     if req.title.trim().is_empty() {
         return Err(err("title is required"));
     }
-    let row = sqlx::query("INSERT INTO videos (title, description, source_type, source_url, category_id, thumbnail_key, approved, status, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *")
+    let row = sqlx::query("INSERT INTO videos (title, description, source_type, source_url, category_id, thumbnail_key, approved, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
         .bind(req.title.trim()).bind(req.description.unwrap_or_default()).bind(req.source_type.unwrap_or_else(|| "upload".into()))
-        .bind(req.source_url).bind(req.category_id).bind(req.thumbnail_key).bind(req.approved.unwrap_or(false)).bind(req.status.unwrap_or_else(|| "draft".into())).bind(user.id)
+        .bind(req.source_url).bind(req.category_id).bind(req.thumbnail_key).bind(req.approved.unwrap_or(false)).bind(req.status.unwrap_or_else(|| "draft".into()))
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
     let id: Uuid = row.get("id");
-    audit(
-        &state.db,
-        Some(user.id),
-        "create",
-        "video",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "create", "video", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 #[utoipa::path(put, path = "/videos/{id}", request_body = VideoInput)]
 async fn update_video(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<VideoInput>,
 ) -> ApiResult<Json<Value>> {
@@ -920,22 +389,13 @@ async fn update_video(
         .bind(req.title.trim()).bind(req.description.unwrap_or_default()).bind(req.category_id).bind(req.thumbnail_key)
         .bind(req.approved.unwrap_or(false)).bind(req.status).bind(id)
         .fetch_one(&state.db).await.map_err(|_| err("video not found"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "edit",
-        "video",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "edit", "video", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 #[utoipa::path(delete, path = "/videos/{id}")]
 async fn delete_video(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("UPDATE videos SET status='archived', updated_at=now() WHERE id=$1")
@@ -943,15 +403,7 @@ async fn delete_video(
         .execute(&state.db)
         .await
         .map_err(|_| err("delete failed"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "delete",
-        "video",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "delete", "video", Some(id), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -965,7 +417,6 @@ struct AssignRequest {
 #[utoipa::path(post, path = "/videos/{id}/assign", request_body = AssignRequest)]
 async fn assign_video(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<AssignRequest>,
 ) -> ApiResult<Json<Value>> {
@@ -974,7 +425,6 @@ async fn assign_video(
         .bind(id).bind(req.child_profile_id).bind(priority).bind(req.expires_at).execute(&state.db).await.map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
-        Some(user.id),
         "assign",
         "video",
         Some(id),
@@ -987,7 +437,6 @@ async fn assign_video(
 #[utoipa::path(delete, path = "/videos/{id}/assign/{child_id}")]
 async fn unassign_video(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path((id, child_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("DELETE FROM video_assignments WHERE video_id=$1 AND child_profile_id=$2")
@@ -998,7 +447,6 @@ async fn unassign_video(
         .map_err(|_| err("unassign failed"))?;
     audit(
         &state.db,
-        Some(user.id),
         "unassign",
         "video",
         Some(id),
@@ -1011,7 +459,6 @@ async fn unassign_video(
 #[utoipa::path(get, path = "/children/{id}/library")]
 async fn child_library(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     rows_json(sqlx::query("SELECT v.*, va.download_priority, va.expires_at FROM videos v JOIN video_assignments va ON va.video_id=v.id WHERE va.child_profile_id=$1 AND v.approved=true AND v.status='ready' AND (va.expires_at IS NULL OR va.expires_at > now()) ORDER BY v.title")
@@ -1021,7 +468,6 @@ async fn child_library(
 #[utoipa::path(get, path = "/videos/{id}/playback-url")]
 async fn playback_url(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let row = sqlx::query("SELECT storage_key FROM video_assets WHERE video_id=$1 AND kind='mp4' ORDER BY version DESC, created_at DESC LIMIT 1")
@@ -1035,7 +481,6 @@ async fn playback_url(
 #[utoipa::path(get, path = "/videos/{id}/download-manifest")]
 async fn download_manifest(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let rows = sqlx::query("SELECT * FROM video_assets WHERE video_id=$1 AND kind IN ('mp4','thumbnail') ORDER BY kind, version DESC").bind(id).fetch_all(&state.db).await.map_err(|_| err("assets not found"))?;
@@ -1070,7 +515,6 @@ struct DeviceRegister {
 #[utoipa::path(post, path = "/devices/register")]
 async fn register_device(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Json(req): Json<DeviceRegister>,
 ) -> ApiResult<Json<Value>> {
     let row = sqlx::query("INSERT INTO devices (child_profile_id, name, platform, storage_quota_mb) VALUES ($1,$2,$3,$4) RETURNING *")
@@ -1081,7 +525,6 @@ async fn register_device(
 #[utoipa::path(post, path = "/devices/{id}/sync")]
 async fn sync_device(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let device = sqlx::query("SELECT * FROM devices WHERE id=$1")
@@ -1138,7 +581,6 @@ struct WatchProgressInput {
 #[utoipa::path(post, path = "/watch-progress")]
 async fn watch_progress(
     State(state): State<AppState>,
-    _user: AuthedUser,
     Json(req): Json<WatchProgressInput>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("INSERT INTO watch_progress (child_profile_id, video_id, device_id, position_seconds, completed) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (child_profile_id, video_id, device_id) DO UPDATE SET position_seconds=$4, completed=$5, updated_at=now()")
@@ -1156,7 +598,6 @@ struct PresignRequest {
 #[utoipa::path(post, path = "/uploads/presign")]
 async fn presign_upload(
     State(_state): State<AppState>,
-    _user: AuthedUser,
     Json(_req): Json<PresignRequest>,
 ) -> ApiResult<Json<Value>> {
     Err(err("presigned raw uploads are disabled; use /uploads/direct so HappiE stores only optimized media"))
@@ -1174,7 +615,6 @@ struct CompleteUploadRequest {
 #[utoipa::path(post, path = "/uploads/complete")]
 async fn complete_upload(
     State(_state): State<AppState>,
-    _user: AuthedUser,
     Json(_req): Json<CompleteUploadRequest>,
 ) -> ApiResult<Json<Value>> {
     Err(err("raw upload completion is disabled; use /uploads/direct so HappiE stores only optimized media"))
@@ -1182,7 +622,6 @@ async fn complete_upload(
 
 async fn direct_upload(
     State(state): State<AppState>,
-    user: AuthedUser,
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
     let mut title = "Untitled upload".to_string();
@@ -1212,12 +651,11 @@ async fn direct_upload(
     let Some((mp4_key, thumbnail_key, mp4_size, thumbnail_mime, thumbnail_size)) = uploaded else {
         return Err(err("file is required"));
     };
-    let video = sqlx::query("INSERT INTO videos (title, description, source_type, status, approved, thumbnail_key, file_size_bytes, created_by, metadata) VALUES ($1,$2,'upload','ready',false,$3,$4,$5,$6) RETURNING *")
+    let video = sqlx::query("INSERT INTO videos (title, description, source_type, status, approved, thumbnail_key, file_size_bytes, metadata) VALUES ($1,$2,'upload','ready',false,$3,$4,$5) RETURNING *")
         .bind(title.trim())
         .bind(description)
         .bind(&thumbnail_key)
         .bind(mp4_size)
-        .bind(user.id)
         .bind(json!({"storage_policy": "optimized_only"}))
         .fetch_one(&state.db)
         .await
@@ -1241,7 +679,6 @@ async fn direct_upload(
         .map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
-        Some(user.id),
         "upload",
         "video",
         Some(video_id),
@@ -1418,10 +855,7 @@ async fn optimize_uploaded_video_inner(
 }
 
 #[utoipa::path(get, path = "/storage/summary")]
-async fn storage_summary(
-    State(state): State<AppState>,
-    _user: AuthedUser,
-) -> ApiResult<Json<Value>> {
+async fn storage_summary(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let totals = sqlx::query("SELECT COALESCE(SUM(file_size_bytes), 0)::bigint AS total_bytes, COALESCE(SUM(CASE WHEN kind IN ('original','mp4','hls') THEN file_size_bytes ELSE 0 END), 0)::bigint AS video_bytes, COALESCE(SUM(CASE WHEN kind='thumbnail' THEN file_size_bytes ELSE 0 END), 0)::bigint AS thumbnail_bytes, COUNT(*)::bigint AS asset_count, COUNT(DISTINCT video_id)::bigint AS video_count FROM video_assets")
         .fetch_one(&state.db)
         .await
@@ -1484,18 +918,16 @@ struct YoutubeSearchInput {
 #[utoipa::path(post, path = "/imports/youtube/search")]
 async fn youtube_search(
     State(state): State<AppState>,
-    user: AuthedUser,
     Json(req): Json<YoutubeSearchInput>,
 ) -> ApiResult<Json<Value>> {
     if req.query.trim().is_empty() {
         return Err(err("query is required"));
     }
-    let row = sqlx::query("INSERT INTO import_jobs (provider, query, status, requested_by, metadata) VALUES ('youtube',$1,'searching',$2,$3) RETURNING *")
-        .bind(req.query.trim()).bind(user.id).bind(json!({"legal_notice": "User is responsible for rights, platform terms, and copyright compliance."}))
+    let row = sqlx::query("INSERT INTO import_jobs (provider, query, status, metadata) VALUES ('youtube',$1,'searching',$2) RETURNING *")
+        .bind(req.query.trim()).bind(json!({"legal_notice": "User is responsible for rights, platform terms, and copyright compliance."}))
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
-        Some(user.id),
         "import_search",
         "import_job",
         Some(row.get("id")),
@@ -1519,7 +951,6 @@ struct YoutubeUrlInput {
 #[utoipa::path(post, path = "/imports/youtube/url")]
 async fn youtube_url(
     State(state): State<AppState>,
-    user: AuthedUser,
     Json(req): Json<YoutubeUrlInput>,
 ) -> ApiResult<Json<Value>> {
     if !req.url.starts_with("http") {
@@ -1549,8 +980,8 @@ async fn youtube_url(
             .ok_or_else(|| err("child profile not found"))?;
     }
     let has_assignments = !child_profile_ids.is_empty();
-    let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, status, requested_by, metadata) VALUES ('youtube',$1,'pending',$2,$3) RETURNING *")
-        .bind(req.url).bind(user.id).bind(json!({
+    let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, status, metadata) VALUES ('youtube',$1,'pending',$2) RETURNING *")
+        .bind(req.url).bind(json!({
             "title": req.title,
             "child_profile_id": child_profile_ids.first(),
             "child_profile_ids": child_profile_ids,
@@ -1562,7 +993,6 @@ async fn youtube_url(
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
-        Some(user.id),
         "import_create",
         "import_job",
         Some(row.get("id")),
@@ -1572,7 +1002,7 @@ async fn youtube_url(
     Ok(Json(row_to_json(&row)))
 }
 
-async fn list_imports(State(state): State<AppState>, _user: AuthedUser) -> ApiResult<Json<Value>> {
+async fn list_imports(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     rows_json(
         sqlx::query("SELECT * FROM import_jobs ORDER BY created_at DESC")
             .fetch_all(&state.db)
@@ -1581,11 +1011,7 @@ async fn list_imports(State(state): State<AppState>, _user: AuthedUser) -> ApiRe
 }
 
 #[utoipa::path(get, path = "/imports/{id}")]
-async fn get_import(
-    State(state): State<AppState>,
-    _user: AuthedUser,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<Value>> {
+async fn get_import(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
     let row = sqlx::query("SELECT * FROM import_jobs WHERE id=$1")
         .bind(id)
         .fetch_one(&state.db)
@@ -1597,26 +1023,16 @@ async fn get_import(
 #[utoipa::path(post, path = "/imports/{id}/cancel")]
 async fn cancel_import(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     sqlx::query("UPDATE import_jobs SET status='cancelled', updated_at=now() WHERE id=$1 AND status <> 'completed'").bind(id).execute(&state.db).await.map_err(|_| err("cancel failed"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "cancel",
-        "import_job",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "cancel", "import_job", Some(id), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
 #[utoipa::path(post, path = "/imports/{id}/retry")]
 async fn retry_import(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let row = sqlx::query(
@@ -1639,21 +1055,12 @@ async fn retry_import(
 
     let row =
         row.ok_or_else(|| err("only failed or cancelled imports without a video can be retried"))?;
-    audit(
-        &state.db,
-        Some(user.id),
-        "retry",
-        "import_job",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "retry", "import_job", Some(id), json!({})).await;
     Ok(Json(row_to_json(&row)))
 }
 
 async fn delete_import(
     State(state): State<AppState>,
-    user: AuthedUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let row =
@@ -1665,36 +1072,11 @@ async fn delete_import(
     if row.is_none() {
         return Err(err("import not found or already created a video"));
     }
-    audit(
-        &state.db,
-        Some(user.id),
-        "delete",
-        "import_job",
-        Some(id),
-        json!({}),
-    )
-    .await;
+    audit(&state.db, "delete", "import_job", Some(id), json!({})).await;
     Ok(Json(json!({"ok": true})))
 }
 
-fn worker_auth(headers: &HeaderMap, state: &AppState) -> ApiResult<()> {
-    let ok = headers
-        .get("x-worker-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == state.worker_token)
-        .unwrap_or(false);
-    if ok {
-        Ok(())
-    } else {
-        Err(err("invalid worker token"))
-    }
-}
-
-async fn worker_next_import(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    worker_auth(&headers, &state)?;
+async fn worker_next_import(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let row = sqlx::query("UPDATE import_jobs SET status='downloading', progress=5, updated_at=now() WHERE id = (SELECT id FROM import_jobs WHERE status IN ('pending','searching') OR (status IN ('downloading','processing','uploading') AND updated_at < now() - interval '15 minutes') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
         .fetch_optional(&state.db).await.map_err(|e| err(e.to_string()))?;
     Ok(Json(
@@ -1748,20 +1130,17 @@ struct PlaylistItemInput {
 
 async fn worker_create_playlist_items(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(req): Json<PlaylistItemsInput>,
 ) -> ApiResult<Json<Value>> {
-    worker_auth(&headers, &state)?;
     if req.items.is_empty() {
         return Err(err("playlist has no videos"));
     }
-    let parent = sqlx::query("SELECT requested_by, metadata FROM import_jobs WHERE id=$1")
+    let parent = sqlx::query("SELECT metadata FROM import_jobs WHERE id=$1")
         .bind(id)
         .fetch_one(&state.db)
         .await
         .map_err(|_| err("playlist import not found"))?;
-    let requested_by: Option<Uuid> = parent.get("requested_by");
     let parent_metadata: Value = parent.get("metadata");
     let mut created = Vec::new();
     for item in req.items {
@@ -1780,10 +1159,9 @@ async fn worker_create_playlist_items(
             "playlist_index": item.index,
             "legal_notice": "User is responsible for rights, platform terms, and copyright compliance."
         });
-        let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, selected_external_id, status, requested_by, metadata) VALUES ('youtube',$1,$2,'pending',$3,$4) RETURNING *")
+        let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, selected_external_id, status, metadata) VALUES ('youtube',$1,$2,'pending',$3) RETURNING *")
             .bind(item.url)
             .bind(item.external_id)
-            .bind(requested_by)
             .bind(metadata)
             .fetch_one(&state.db)
             .await
@@ -1797,24 +1175,20 @@ async fn worker_create_playlist_items(
 
 async fn worker_update_import(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(req): Json<WorkerStatusInput>,
 ) -> ApiResult<Json<Value>> {
-    worker_auth(&headers, &state)?;
     let mut result_video_id = None;
     if req.status == "completed" && req.video.is_some() {
         let Some(video) = req.video else {
             unreachable!()
         };
-        let import_row =
-            sqlx::query("SELECT source_url, requested_by, metadata FROM import_jobs WHERE id=$1")
-                .bind(id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|_| err("import not found"))?;
+        let import_row = sqlx::query("SELECT source_url, metadata FROM import_jobs WHERE id=$1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| err("import not found"))?;
         let source_url: Option<String> = import_row.get("source_url");
-        let requested_by: Option<Uuid> = import_row.get("requested_by");
         let import_metadata: Value = import_row.get("metadata");
         let approve = import_metadata
             .get("approve")
@@ -1824,8 +1198,8 @@ async fn worker_update_import(
             "import": import_metadata,
             "worker": req.metadata.clone().unwrap_or_else(|| json!({}))
         });
-        let row = sqlx::query("INSERT INTO videos (title, description, source_type, source_url, thumbnail_key, duration_seconds, status, approved, file_size_bytes, metadata, created_by) VALUES ($1,$2,'youtube',$3,$4,$5,'ready',$6,$7,$8,$9) RETURNING *")
-            .bind(video.title).bind(video.description.unwrap_or_default()).bind(source_url).bind(video.thumbnail_key).bind(video.duration_seconds).bind(approve).bind(video.file_size_bytes).bind(merged_metadata).bind(requested_by)
+        let row = sqlx::query("INSERT INTO videos (title, description, source_type, source_url, thumbnail_key, duration_seconds, status, approved, file_size_bytes, metadata) VALUES ($1,$2,'youtube',$3,$4,$5,'ready',$6,$7,$8) RETURNING *")
+            .bind(video.title).bind(video.description.unwrap_or_default()).bind(source_url).bind(video.thumbnail_key).bind(video.duration_seconds).bind(approve).bind(video.file_size_bytes).bind(merged_metadata)
             .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
         let video_id: Uuid = row.get("id");
         result_video_id = Some(video_id);

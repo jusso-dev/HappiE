@@ -2,38 +2,14 @@ export const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhos
 
 export type ApiError = { error: string };
 
-export function getToken() {
-  if (typeof window === "undefined") return "";
-  return localStorage.getItem("happie_access_token") || "";
-}
-
-export function setTokens(access: string, refresh: string) {
-  localStorage.setItem("happie_access_token", access);
-  localStorage.setItem("happie_refresh_token", refresh);
-}
-
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (!headers.has("Content-Type") && !(options.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
-  const token = getToken();
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
-  } else if (typeof window !== "undefined" && window.location.pathname !== "/login") {
-    window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
-    throw new Error("Please sign in");
-  }
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers, cache: "no-store" });
   if (!res.ok) {
     const body = (await res.json().catch(() => ({ error: res.statusText }))) as ApiError;
-    if (res.status === 401 || body.error === "missing bearer token") {
-      localStorage.removeItem("happie_access_token");
-      localStorage.removeItem("happie_refresh_token");
-      if (typeof window !== "undefined" && window.location.pathname !== "/login") {
-        window.location.href = `/login?next=${encodeURIComponent(window.location.pathname)}`;
-      }
-    }
     throw new Error(body.error || res.statusText);
   }
   return res.json() as Promise<T>;
@@ -82,14 +58,6 @@ export type ImportJob = {
   result_video_id?: string;
   metadata?: Record<string, unknown>;
   created_at: string;
-};
-
-export type AdminUser = {
-  id: string;
-  email: string;
-  role: "owner" | "admin" | "viewer";
-  created_at: string;
-  updated_at: string;
 };
 
 export type StorageBreakdown = {

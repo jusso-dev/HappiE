@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { Film, Home, Import, LogOut, Settings, Users } from "lucide-react";
-import { Button, cn } from "@/components/ui";
+import { usePathname } from "next/navigation";
+import { Film, Home, Import, Settings, Users } from "lucide-react";
+import { cn } from "@/components/ui";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: Home },
@@ -15,11 +15,6 @@ const nav = [
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const router = useRouter();
-  const signOut = () => {
-    localStorage.clear();
-    router.push("/login");
-  };
 
   return (
     <div className="min-h-screen">
@@ -43,13 +38,6 @@ export function Shell({ children }: { children: React.ReactNode }) {
             );
           })}
         </nav>
-        <Button
-          variant="secondary"
-          className="absolute bottom-4 left-3 right-3"
-          onClick={signOut}
-        >
-          <LogOut size={16} /> Sign out
-        </Button>
       </aside>
       <header className="sticky top-0 z-20 border-b border-border bg-panel md:hidden">
         <div className="flex h-14 items-center justify-between gap-3 px-4">
@@ -57,10 +45,6 @@ export function Shell({ children }: { children: React.ReactNode }) {
             <span className="grid size-8 place-items-center rounded-ui bg-accent text-sm text-panel">H</span>
             HappiE
           </Link>
-          <Button variant="secondary" className="h-8 px-2.5" onClick={signOut} aria-label="Sign out">
-            <LogOut size={15} />
-            <span className="sr-only">Sign out</span>
-          </Button>
         </div>
         <nav className="flex gap-1 overflow-x-auto px-3 pb-3">
           {nav.map((item) => {

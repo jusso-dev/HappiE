@@ -13,11 +13,11 @@ This repository is designed to be safe to publish without local secrets. Keep th
 - Never commit `.env`, object-storage credentials, database dumps, uploaded media, or local Docker volumes.
 - Use `.env.example` as the only committed environment template.
 - Treat the Docker Compose defaults as local-development values only.
-- Set `APP_ENV=production` outside local development; the API will refuse common weak/default secrets in production mode.
+- Keep the API and admin UI on a trusted LAN. HappiE intentionally has no application-level authentication and must not be exposed to the public internet.
 
 ## Architecture
 
-- `services/api`: Rust Axum API. This is the authoritative layer for auth, business rules, storage signing, metadata, imports, and sync.
+- `services/api`: Rust Axum API. This is the authoritative layer for business rules, storage signing, metadata, imports, and sync.
 - `apps/admin-web`: Next.js App Router admin UI. It only calls the HappiE API.
 - `apps/import-worker`: TypeScript worker using `yt-dlp` and FFmpeg inside Docker.
 - `apps/ios-placeholder`: SwiftUI readiness notes. The iPad app is not implemented yet.
@@ -38,21 +38,15 @@ Services:
 - OpenAPI docs: http://localhost:18080/docs
 - MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin`)
 
-Bootstrap login:
-
-- Email: `owner@happie.local`
-- Password: the value of `ADMIN_BOOTSTRAP_PASSWORD` in your `.env`
-
-Change all secrets in `.env` before using non-local data. Do not commit `.env`.
+HappiE is LAN-local and does not have a login screen. Open the admin UI directly after the services start. Keep object-storage and database credentials private, and do not commit `.env`.
 
 ## Admin Workflows
 
-1. Sign in at `/login`.
-2. Create child profiles at `/children`, for example `H` and `E`.
-3. Upload a private video at `/videos/new`.
-4. Open a video detail page, approve it, and assign it to one or more child profiles.
-5. Import user-supplied YouTube content from `/imports/youtube`.
-6. Watch import progress at `/imports`.
+1. Create child profiles at `/children`, for example `H` and `E`.
+2. Upload a private video at `/videos/new`.
+3. Open a video detail page, approve it, and assign it to one or more child profiles.
+4. Import user-supplied YouTube content from `/imports/youtube`.
+5. Watch import progress at `/imports`.
 
 The admin UI displays a legal warning for YouTube imports: users are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law.
 
@@ -73,16 +67,12 @@ For a physical iPad on your LAN, the API and signed storage URLs must be reachab
 PUBLIC_API_BASE_URL=http://YOUR_LAN_IP:18080
 NEXT_PUBLIC_API_BASE_URL=http://YOUR_LAN_IP:18080
 R2_ENDPOINT=http://YOUR_LAN_IP:9000
-ALLOWED_ORIGINS=http://YOUR_LAN_IP:5500,http://localhost:5500,http://localhost:3000
 ```
 
 ## API Notes
 
 Key endpoints:
 
-- `POST /auth/login`
-- `POST /auth/refresh`
-- `GET /me`
 - `CRUD /children`
 - `CRUD /videos`
 - `CRUD /categories`
@@ -101,7 +91,7 @@ Key endpoints:
 - `POST /imports/:id/cancel`
 - `GET /health`
 
-Worker-only endpoints use `x-worker-token`:
+Local import-worker endpoints also operate without credentials:
 
 - `POST /worker/imports/next`
 - `POST /worker/imports/:id/status`
@@ -110,7 +100,6 @@ Worker-only endpoints use `x-worker-token`:
 
 The iPad app lives in the separate `HappiE-App/HappiE` Xcode project. Current client flows:
 
-- Parent login through the API.
 - Device registration: call `POST /devices/register`.
 - Child selection: bind the selected child profile to the device.
 - Library sync: call `POST /devices/:id/sync` and persist the manifest.
@@ -149,22 +138,17 @@ docker compose build
 
 Local `cargo` is optional if you use Docker, but it gives faster API checks.
 
-## Security Defaults
+## Local Deployment Boundaries
 
-- Argon2 password hashing.
-- JWT access tokens and refresh token rotation.
-- Role field for `owner`, `admin`, and `viewer`.
-- Worker token auth for import worker callbacks.
+- No login, bearer token, role gate, or worker token is required. This is intentional for a trusted, offline-first LAN installation.
+- Do not publish the API, admin UI, database, or object-storage ports to the public internet.
 - API-mediated signed storage URLs.
-- CORS configured from `ALLOWED_ORIGINS`; no wildcard CORS by default.
-- Audit logs for login, uploads, imports, edits, assignments, and deletes.
+- Permissive CORS allows the admin UI and local clients to use the API from changing LAN origins without credential headers.
+- Audit logs record the `local_api` actor for uploads, imports, edits, assignments, and deletes.
 - File type and size validation.
-- Production mode rejects known weak/default secrets.
 
-TODO for production hardening:
+TODO for local product hardening:
 
-- Add persistent login rate limiting using Redis.
-- Add full role/permission gates per route.
 - Add parent PIN management endpoints.
 - Add HLS generation and adaptive playback.
 - Add background processing for direct uploads.

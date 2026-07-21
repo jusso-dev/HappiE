@@ -41,7 +41,6 @@ type YoutubeMediaInfo = {
 };
 
 const apiBase = process.env.PUBLIC_API_BASE_URL || "http://happie-api:8080";
-const workerToken = process.env.IMPORT_WORKER_TOKEN || "dev-worker-token";
 const maxConcurrent = Number(process.env.MAX_CONCURRENT_IMPORTS || "2");
 const maxMb = Number(process.env.MAX_IMPORT_FILE_SIZE_MB || "2048");
 const maxPlaylistItems = process.env.MAX_PLAYLIST_ITEMS ? Number(process.env.MAX_PLAYLIST_ITEMS) : undefined;
@@ -141,7 +140,6 @@ function playlistEntryUrl(entry: PlaylistEntry) {
 async function api<T>(pathName: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
-  headers.set("x-worker-token", workerToken);
   const res = await fetch(`${apiBase}${pathName}`, { ...init, headers });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
