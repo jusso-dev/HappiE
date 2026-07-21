@@ -461,8 +461,13 @@ async fn child_library(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    rows_json(sqlx::query("SELECT v.*, va.download_priority, va.expires_at FROM videos v JOIN video_assignments va ON va.video_id=v.id WHERE va.child_profile_id=$1 AND v.approved=true AND v.status='ready' AND (va.expires_at IS NULL OR va.expires_at > now()) ORDER BY v.title")
-        .bind(id).fetch_all(&state.db).await)
+    let rows = sqlx::query("SELECT v.*, va.download_priority, va.expires_at FROM videos v JOIN video_assignments va ON va.video_id=v.id WHERE va.child_profile_id=$1 AND v.approved=true AND v.status='ready' AND (va.expires_at IS NULL OR va.expires_at > now()) ORDER BY v.created_at DESC")
+        .bind(id).fetch_all(&state.db).await.map_err(|e| err(e.to_string()))?;
+    let mut videos = Vec::new();
+    for row in rows {
+        videos.push(video_json(&state, &row, false).await?);
+    }
+    Ok(Json(Value::Array(videos)))
 }
 
 #[utoipa::path(get, path = "/videos/{id}/playback-url")]
@@ -541,7 +546,7 @@ async fn sync_device(
         .execute(&state.db)
         .await
         .ok();
-    let rows = sqlx::query("SELECT v.id, v.title, v.description, v.thumbnail_key, v.duration_seconds, va.download_priority, va.expires_at FROM videos v JOIN video_assignments va ON va.video_id=v.id WHERE va.child_profile_id=$1 AND v.approved=true AND v.status='ready' AND (va.expires_at IS NULL OR va.expires_at > now())")
+    let rows = sqlx::query("SELECT v.id, v.title, v.description, v.thumbnail_key, v.duration_seconds, va.download_priority, va.expires_at FROM videos v JOIN video_assignments va ON va.video_id=v.id WHERE va.child_profile_id=$1 AND v.approved=true AND v.status='ready' AND (va.expires_at IS NULL OR va.expires_at > now()) ORDER BY v.created_at DESC")
         .bind(child_id).fetch_all(&state.db).await.map_err(|_| err("sync failed"))?;
     let mut videos = Vec::new();
     for row in rows {
