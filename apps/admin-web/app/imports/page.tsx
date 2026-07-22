@@ -31,6 +31,7 @@ function statusTone(status: string): "neutral" | "success" | "warning" | "danger
 export default function ImportsPage() {
   const [jobs, setJobs] = useState<ImportJob[]>([]);
   const [busyJobId, setBusyJobId] = useState<string | null>(null);
+  const [isRetryingFailed, setIsRetryingFailed] = useState(false);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sort, setSort] = useState("created_desc");
@@ -81,6 +82,19 @@ export default function ImportsPage() {
     }
   }
 
+  async function retryAllFailed() {
+    const failedJobIds = jobs.filter((job) => job.status === "failed").map((job) => job.id);
+    if (failedJobIds.length === 0 || !window.confirm(`Retry all ${failedJobIds.length} failed import jobs?`)) return;
+
+    setIsRetryingFailed(true);
+    try {
+      await Promise.allSettled(failedJobIds.map((id) => api(`/imports/${id}/retry`, { method: "POST" })));
+      await load();
+    } finally {
+      setIsRetryingFailed(false);
+    }
+  }
+
   const filteredJobs = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return [...jobs]
@@ -97,12 +111,18 @@ export default function ImportsPage() {
       });
   }, [jobs, query, sort, statusFilter]);
   const statuses = Array.from(new Set(jobs.map((job) => job.status))).sort();
+  const failedJobCount = jobs.filter((job) => job.status === "failed").length;
 
   return (
     <Shell>
       <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div><h1 className="page-title">Imports</h1><p className="page-subtitle">YouTube imports are user-supplied content jobs.</p></div>
-        <Button asChild className="w-full sm:w-auto"><Link href="/imports/youtube"><Search size={16} /> YouTube import</Link></Button>
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+          <Button variant="secondary" className="w-full sm:w-auto" onClick={retryAllFailed} disabled={failedJobCount === 0 || isRetryingFailed}>
+            <RotateCcw size={16} /> {isRetryingFailed ? "Retrying failed jobs" : `Retry all failed${failedJobCount ? ` (${failedJobCount})` : ""}`}
+          </Button>
+          <Button asChild className="w-full sm:w-auto"><Link href="/imports/youtube"><Search size={16} /> YouTube import</Link></Button>
+        </div>
       </div>
       <Panel className="p-0">
         <div className="grid gap-3 border-b border-border p-5 md:grid-cols-[minmax(0,1fr)_170px_180px]">
