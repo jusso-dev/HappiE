@@ -1,24 +1,28 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useParams } from "next/navigation";
-import { Check, ImageIcon, Save } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import { Check, ImageIcon, Save, Trash2, X } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { Button, Field, Panel } from "@/components/ui";
+import { Button, ChildAvatar, Field, Panel } from "@/components/ui";
 import { api, ChildProfile, Video } from "@/lib/api";
 
 export default function VideoDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const [video, setVideo] = useState<Video | null>(null);
   const [children, setChildren] = useState<ChildProfile[]>([]);
   const [priority, setPriority] = useState("normal");
   const [selectedChildIds, setSelectedChildIds] = useState<string[]>([]);
   const [savingAssignments, setSavingAssignments] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
   const [assignmentMessage, setAssignmentMessage] = useState("");
   const [assignmentError, setAssignmentError] = useState("");
   const [childQuery, setChildQuery] = useState("");
   const [assignmentFilter, setAssignmentFilter] = useState("all");
   const [childSort, setChildSort] = useState("name_asc");
+  const [unassigningChildId, setUnassigningChildId] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     loadVideo().catch(() => {});
@@ -33,7 +37,41 @@ export default function VideoDetailPage() {
 
   async function save() {
     if (!video) return;
-    setVideo(await api<Video>(`/videos/${id}`, { method: "PUT", body: JSON.stringify(video) }));
+    setSaveMessage("");
+    try {
+      const saved = await api<Video>(`/videos/${id}`, { method: "PUT", body: JSON.stringify(video) });
+      setVideo({ ...video, ...saved });
+      setSaveMessage("Saved.");
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "Save failed");
+    }
+  }
+
+  async function unassignChild(childId: string) {
+    setUnassigningChildId(childId);
+    setAssignmentError("");
+    setAssignmentMessage("");
+    try {
+      await api(`/videos/${id}/assign/${childId}`, { method: "DELETE" });
+      await loadVideo();
+    } catch (error) {
+      setAssignmentError(error instanceof Error ? error.message : "Unassign failed");
+    } finally {
+      setUnassigningChildId("");
+    }
+  }
+
+  async function deleteVideo() {
+    if (!video) return;
+    if (!window.confirm(`Delete “${video.title}” and its stored files? This cannot be undone.`)) return;
+    setDeleting(true);
+    try {
+      await api(`/videos/${id}`, { method: "DELETE" });
+      router.push("/videos");
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "Delete failed");
+      setDeleting(false);
+    }
   }
 
   function toggleChild(childId: string) {
@@ -104,7 +142,13 @@ export default function VideoDetailPage() {
             <Field label="Title"><input value={video.title} onChange={(e) => setVideo({ ...video, title: e.target.value })} /></Field>
             <Field label="Description"><textarea rows={5} value={video.description || ""} onChange={(e) => setVideo({ ...video, description: e.target.value })} /></Field>
             <label className="flex items-center gap-2"><input type="checkbox" checked={video.approved} onChange={(e) => setVideo({ ...video, approved: e.target.checked })} /> Approved for kids</label>
-            <Button onClick={save} className="w-full sm:w-fit"><Save size={16} /> Save</Button>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <Button onClick={save} className="w-full sm:w-fit"><Save size={16} /> Save</Button>
+              <Button variant="danger" onClick={deleteVideo} disabled={deleting} className="w-full sm:w-fit">
+                <Trash2 size={15} /> {deleting ? "Deleting..." : "Delete video"}
+              </Button>
+            </div>
+            {saveMessage && <p className="text-sm text-muted">{saveMessage}</p>}
           </div>
         </Panel>
         <Panel>
@@ -138,8 +182,11 @@ export default function VideoDetailPage() {
             {filteredChildren.map((child) => {
               const selected = selectedChildIds.includes(child.id);
               return (
-                <label key={child.id} className="flex cursor-pointer items-center justify-between rounded-ui border border-border bg-panel px-3 py-3 text-sm transition hover:border-accent/25 hover:bg-accent/5">
-                  <span className="font-medium text-ink">{child.name}</span>
+                <label key={child.id} className="flex cursor-pointer items-center justify-between rounded-ui border border-border bg-panel px-3 py-2.5 text-sm transition hover:border-accent/25 hover:bg-accent/5">
+                  <span className="flex items-center gap-2 font-medium text-ink">
+                    <ChildAvatar name={child.name} color={child.avatar_color} size="sm" />
+                    {child.name}
+                  </span>
                   <span className="flex items-center gap-2 text-muted">
                     {selected && <Check size={15} className="text-accent" />}
                     <input type="checkbox" checked={selected} onChange={() => toggleChild(child.id)} />
@@ -162,12 +209,29 @@ export default function VideoDetailPage() {
           {video.assignments && video.assignments.length > 0 && (
             <div className="mt-5 grid gap-2">
               <div className="text-xs font-medium uppercase text-muted">Currently assigned</div>
-              {video.assignments.map((assignment) => (
-                <div key={assignment.child_profile_id} className="flex items-center justify-between gap-3 rounded-ui border border-border bg-ink/[0.03] px-3 py-2 text-sm">
-                  <span>{assignment.child_name}</span>
-                  <span className="shrink-0 text-muted">{assignment.download_priority}</span>
-                </div>
-              ))}
+              {video.assignments.map((assignment) => {
+                const child = children.find((item) => item.id === assignment.child_profile_id);
+                return (
+                  <div key={assignment.child_profile_id} className="flex items-center justify-between gap-3 rounded-ui border border-border bg-ink/[0.03] px-3 py-2 text-sm">
+                    <span className="flex min-w-0 items-center gap-2">
+                      <ChildAvatar name={assignment.child_name} color={child?.avatar_color} size="sm" />
+                      <span className="truncate">{assignment.child_name}</span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-2">
+                      <span className="text-muted">{assignment.download_priority}</span>
+                      <button
+                        type="button"
+                        onClick={() => unassignChild(assignment.child_profile_id)}
+                        disabled={unassigningChildId === assignment.child_profile_id}
+                        aria-label={`Unassign ${assignment.child_name}`}
+                        className="grid size-6 place-items-center rounded-full text-danger transition hover:bg-danger/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger/30 disabled:opacity-50"
+                      >
+                        <X size={14} />
+                      </button>
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </Panel>

@@ -145,8 +145,24 @@ async function api<T>(pathName: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Concurrent diagnostic updates (transcode + thumbnail) report different progress
+// values for the same job; without a floor the reported percent jumps backwards.
+const jobProgressFloor = new Map<string, number>();
+
+function monotonicProgress(id: string, progress: number) {
+  const next = Math.max(jobProgressFloor.get(id) ?? 0, Math.min(100, Math.round(progress)));
+  jobProgressFloor.set(id, next);
+  return next;
+}
+
 async function update(id: string, body: Record<string, unknown>) {
+  if (typeof body.progress === "number") {
+    body = { ...body, progress: monotonicProgress(id, body.progress) };
+  }
   await api(`/worker/imports/${id}/status`, { method: "POST", body: JSON.stringify(body) });
+  if (body.status === "completed" || body.status === "failed" || body.status === "cancelled") {
+    jobProgressFloor.delete(id);
+  }
 }
 
 async function updateDiagnostics(job: ImportJob, progress: number, diagnostics: Diagnostics) {
@@ -251,6 +267,16 @@ async function inspectYoutubeMedia(job: ImportJob, videoUrl: string): Promise<Yo
   };
 }
 
+function parseFfmpegTimeSeconds(text: string): number | undefined {
+  const matches = [...text.matchAll(/time=(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/g)];
+  const last = matches[matches.length - 1];
+  if (!last) return undefined;
+  return Number(last[1]) * 3600 + Number(last[2]) * 60 + Number(last[3]);
+}
+
+const TRANSCODE_PROGRESS_START = 52;
+const TRANSCODE_PROGRESS_END = 74;
+
 async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string, key: string, sourceInfo: YoutubeMediaInfo) {
   const output: string[] = [];
   const diagnostics = {
@@ -262,7 +288,7 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     storage: { mp4_key: key },
   };
   const startedAt = now();
-  await updateDiagnostics(job, 52, { ...diagnostics, last_output: output });
+  await updateDiagnostics(job, TRANSCODE_PROGRESS_START, { ...diagnostics, last_output: output });
 
   const downloader = execa("yt-dlp", [
     "--js-runtimes", "node",
@@ -291,8 +317,27 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     "pipe:1",
   ], { timeout: 30 * 60_000, stdin: "pipe", stdout: "pipe" });
 
-  attachTrackedErrorOutput(job, 52, diagnostics, output, startedAt, downloader);
-  attachTrackedErrorOutput(job, 52, diagnostics, output, startedAt, ffmpeg);
+  // FFmpeg's stderr time= counter against the known source duration is the only
+  // live signal for this phase, which is the longest one in the whole import.
+  let transcodeProgress = TRANSCODE_PROGRESS_START;
+  let lastProgressUpdate = 0;
+  const trackTranscode = (chunk: Buffer | string) => {
+    rememberOutput(output, chunk);
+    const transcodedSeconds = parseFfmpegTimeSeconds(String(chunk));
+    if (transcodedSeconds !== undefined && sourceInfo.duration_seconds) {
+      const ratio = Math.min(1, transcodedSeconds / sourceInfo.duration_seconds);
+      transcodeProgress = TRANSCODE_PROGRESS_START + ratio * (TRANSCODE_PROGRESS_END - TRANSCODE_PROGRESS_START);
+    }
+    if (now() - lastProgressUpdate < 1000) return;
+    lastProgressUpdate = now();
+    void updateDiagnostics(job, transcodeProgress, {
+      ...diagnostics,
+      last_output: output,
+      timings: { elapsed_seconds: secondsSince(startedAt) },
+    }).catch(() => {});
+  };
+  downloader.stderr?.on("data", trackTranscode);
+  ffmpeg.stderr?.on("data", trackTranscode);
 
   downloader.stdout?.pipe(ffmpeg.stdin!);
   let fileSizeBytes = 0;
@@ -349,6 +394,7 @@ async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, t
 }
 
 async function processJob(job: ImportJob) {
+  jobProgressFloor.delete(job.id);
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `happie-${job.id}-`));
   try {
     if (metadataString(job, "import_kind") === "playlist") {

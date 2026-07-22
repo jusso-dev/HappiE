@@ -7,7 +7,7 @@ use aws_sdk_s3::{
     Client as S3Client,
 };
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -153,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
             post(worker_create_playlist_items),
         )
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        // Axum's default body limit is 2 MB, far below MAX_IMPORT_FILE_SIZE_MB;
+        // without this, /uploads/direct rejects any real video.
+        .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -348,7 +351,7 @@ async fn list_videos(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         .fetch_all(&state.db).await.map_err(|e| err(e.to_string()))?;
     let mut videos = Vec::new();
     for row in rows {
-        videos.push(video_json(&state, &row, false).await?);
+        videos.push(video_json(&state, &row, true).await?);
     }
     Ok(Json(Value::Array(videos)))
 }
@@ -631,7 +634,7 @@ async fn direct_upload(
 ) -> ApiResult<Json<Value>> {
     let mut title = "Untitled upload".to_string();
     let mut description = String::new();
-    let mut uploaded: Option<(String, String, i64, String, i64)> = None;
+    let mut uploaded: Option<(String, String, i64, String, i64, Option<i32>)> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -653,24 +656,28 @@ async fn direct_upload(
             uploaded = Some(optimize_uploaded_video(&state, bytes.to_vec(), &filename).await?);
         }
     }
-    let Some((mp4_key, thumbnail_key, mp4_size, thumbnail_mime, thumbnail_size)) = uploaded else {
+    let Some((mp4_key, thumbnail_key, mp4_size, thumbnail_mime, thumbnail_size, duration_seconds)) =
+        uploaded
+    else {
         return Err(err("file is required"));
     };
-    let video = sqlx::query("INSERT INTO videos (title, description, source_type, status, approved, thumbnail_key, file_size_bytes, metadata) VALUES ($1,$2,'upload','ready',false,$3,$4,$5) RETURNING *")
+    let video = sqlx::query("INSERT INTO videos (title, description, source_type, status, approved, thumbnail_key, file_size_bytes, duration_seconds, metadata) VALUES ($1,$2,'upload','ready',false,$3,$4,$5,$6) RETURNING *")
         .bind(title.trim())
         .bind(description)
         .bind(&thumbnail_key)
         .bind(mp4_size)
+        .bind(duration_seconds)
         .bind(json!({"storage_policy": "optimized_only"}))
         .fetch_one(&state.db)
         .await
         .map_err(|e| err(e.to_string()))?;
     let video_id: Uuid = video.get("id");
-    sqlx::query("INSERT INTO video_assets (video_id, kind, storage_key, mime_type, file_size_bytes, quality) VALUES ($1,'mp4',$2,'video/mp4',$3,$4)")
+    sqlx::query("INSERT INTO video_assets (video_id, kind, storage_key, mime_type, file_size_bytes, quality, duration_seconds) VALUES ($1,'mp4',$2,'video/mp4',$3,$4,$5)")
         .bind(video_id)
         .bind(mp4_key)
         .bind(mp4_size)
         .bind(optimized_video_quality())
+        .bind(duration_seconds)
         .execute(&state.db)
         .await
         .map_err(|e| err(e.to_string()))?;
@@ -748,7 +755,7 @@ async fn optimize_uploaded_video(
     state: &AppState,
     bytes: Vec<u8>,
     filename: &str,
-) -> ApiResult<(String, String, i64, String, i64)> {
+) -> ApiResult<(String, String, i64, String, i64, Option<i32>)> {
     let upload_id = Uuid::new_v4();
     let work_dir = env::temp_dir().join(format!("happie-upload-{upload_id}"));
     fs::create_dir_all(&work_dir)
@@ -759,13 +766,37 @@ async fn optimize_uploaded_video(
     result
 }
 
+async fn probe_duration_seconds(path: &PathBuf) -> Option<i32> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            &path.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|seconds| seconds.round() as i32)
+}
+
 async fn optimize_uploaded_video_inner(
     state: &AppState,
     bytes: Vec<u8>,
     filename: &str,
     upload_id: Uuid,
     work_dir: &PathBuf,
-) -> ApiResult<(String, String, i64, String, i64)> {
+) -> ApiResult<(String, String, i64, String, i64, Option<i32>)> {
     let source_path = work_dir.join(sanitize_filename(filename));
     let mp4_path = work_dir.join("ipad.mp4");
     let thumb_path = work_dir.join("thumbnail.jpg");
@@ -850,12 +881,14 @@ async fn optimize_uploaded_video_inner(
         .send()
         .await
         .map_err(|_| err("failed to store thumbnail"))?;
+    let duration_seconds = probe_duration_seconds(&mp4_path).await;
     Ok((
         mp4_key,
         thumbnail_key,
         mp4_bytes.len() as i64,
         "image/jpeg".to_string(),
         thumb_bytes.len() as i64,
+        duration_seconds,
     ))
 }
 
@@ -887,6 +920,15 @@ async fn storage_summary(State(state): State<AppState>) -> ApiResult<Json<Value>
         "by_source": by_source.iter().map(row_to_json).collect::<Vec<_>>(),
         "videos": videos.iter().map(row_to_json).collect::<Vec<_>>()
     })))
+}
+
+fn max_upload_body_bytes() -> usize {
+    let max_mb = env::var("MAX_IMPORT_FILE_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048);
+    // Multipart overhead on top of the raw file.
+    (max_mb + 16) * 1024 * 1024
 }
 
 fn validate_video_upload(content_type: &str, size_bytes: i64) -> ApiResult<()> {

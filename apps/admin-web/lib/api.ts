@@ -15,6 +15,28 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return res.json() as Promise<T>;
 }
 
+// fetch() exposes no upload progress events, so direct uploads go through XHR.
+export function uploadWithProgress(path: string, form: FormData, onProgress: (percent: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}${path}`);
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) onProgress((event.loaded / event.total) * 100);
+    });
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      try {
+        reject(new Error((JSON.parse(xhr.responseText) as ApiError).error || xhr.statusText));
+      } catch {
+        reject(new Error(xhr.statusText || `Upload failed (${xhr.status})`));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed: network error")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
+    xhr.send(form);
+  });
+}
+
 export type ChildProfile = {
   id: string;
   name: string;

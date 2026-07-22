@@ -14,7 +14,7 @@ const config: Config = {
         danger: "oklch(55% 0.19 28)"
       },
       borderRadius: {
-        ui: "8px"
+        ui: "10px"
       }
     },
   },

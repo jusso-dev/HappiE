@@ -2,40 +2,49 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
-import { CheckCircle2, ImageIcon, Save } from "lucide-react";
+import { EyeOff, ImageIcon, Minus, Plus, Save } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { Button, Field, Panel } from "@/components/ui";
+import { Button, ChildAvatar, Field, Panel } from "@/components/ui";
 import { api, ChildProfile, Video } from "@/lib/api";
+
+function formatDuration(seconds?: number) {
+  if (!seconds) return "";
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
 
 export default function ChildDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [videos, setVideos] = useState<Video[]>([]);
-  const [assignedIds, setAssignedIds] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [profile, setProfile] = useState<ChildProfile | null>(null);
   const [quota, setQuota] = useState("");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [busyVideoId, setBusyVideoId] = useState("");
   const [query, setQuery] = useState("");
   const [assignFilter, setAssignFilter] = useState("assigned");
   const [sort, setSort] = useState("created_desc");
 
   async function load() {
-    const [children, allVideos, library] = await Promise.all([
+    const [children, allVideos] = await Promise.all([
       api<ChildProfile[]>("/children"),
       api<Video[]>("/videos"),
-      api<Video[]>(`/children/${id}/library`),
     ]);
     const child = children.find((item) => item.id === id) || null;
     setProfile(child);
     setQuota(child ? String(child.storage_quota_mb) : "");
     setVideos(allVideos.filter((video) => video.status !== "archived"));
-    setAssignedIds(new Set(library.map((video) => video.id)));
-    setSelected(new Set());
   }
 
   useEffect(() => { load().catch(() => {}); }, [id]);
+
+  const assignedIds = useMemo(
+    () => new Set(videos.filter((video) => (video.assignments || []).some((a) => a.child_profile_id === id)).map((video) => video.id)),
+    [videos, id]
+  );
 
   async function saveProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -75,6 +84,37 @@ export default function ChildDetailPage() {
     });
   }
 
+  async function assignOne(videoId: string) {
+    if (!profile) return;
+    setBusyVideoId(videoId);
+    setMessage("");
+    try {
+      await api(`/videos/${videoId}/assign`, {
+        method: "POST",
+        body: JSON.stringify({ child_profile_id: profile.id }),
+      });
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Assign failed");
+    } finally {
+      setBusyVideoId("");
+    }
+  }
+
+  async function unassignOne(videoId: string) {
+    if (!profile) return;
+    setBusyVideoId(videoId);
+    setMessage("");
+    try {
+      await api(`/videos/${videoId}/assign/${profile.id}`, { method: "DELETE" });
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unassign failed");
+    } finally {
+      setBusyVideoId("");
+    }
+  }
+
   async function bulkAssign() {
     if (!profile || selected.size === 0) return;
     setBusy(true);
@@ -86,6 +126,7 @@ export default function ChildDetailPage() {
           body: JSON.stringify({ child_profile_id: profile.id }),
         })));
       setMessage(`Assigned ${selected.size} video(s) to ${profile.name}.`);
+      setSelected(new Set());
       await load();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Assign failed");
@@ -102,6 +143,7 @@ export default function ChildDetailPage() {
       await Promise.all([...selected].map((videoId) =>
         api(`/videos/${videoId}/assign/${profile.id}`, { method: "DELETE" })));
       setMessage(`Unassigned ${selected.size} video(s) from ${profile.name}.`);
+      setSelected(new Set());
       await load();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unassign failed");
@@ -139,19 +181,29 @@ export default function ChildDetailPage() {
   }
 
   const allVisibleSelected = filteredVideos.length > 0 && filteredVideos.every((video) => selected.has(video.id));
+  const selectedAssigned = [...selected].filter((videoId) => assignedIds.has(videoId)).length;
+  const selectedUnassigned = selected.size - selectedAssigned;
 
   return (
     <Shell>
-      <h1 className="page-title">{profile?.name || "Child profile"}</h1>
-      <p className="page-subtitle mb-6">Edit the iPad quota and manage which approved videos this child can watch.</p>
-      <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
-        <Panel>
+      <div className="flex items-center gap-3">
+        {profile && <ChildAvatar name={profile.name} color={profile.avatar_color} />}
+        <div>
+          <h1 className="page-title">{profile?.name || "Child profile"}</h1>
+          <p className="page-subtitle">Edit the iPad quota and manage which approved videos this child can watch.</p>
+        </div>
+      </div>
+      <div className="mt-6 grid gap-6 lg:grid-cols-[360px_1fr]">
+        <Panel className="self-start">
           <form onSubmit={saveProfile} className="grid gap-4">
             <Field label="Name"><input value={profile?.name || ""} disabled /></Field>
             <Field label="iPad quota, MB"><input type="number" min={256} step={256} value={quota} onChange={(event) => setQuota(event.target.value)} /></Field>
             <Button disabled={!profile || saving}><Save size={16} /> {saving ? "Saving..." : "Save quota"}</Button>
-            {message && <p className="text-sm text-muted">{message}</p>}
           </form>
+          <div className="mt-4 grid gap-1 border-t border-border pt-4 text-sm text-muted">
+            <div className="flex justify-between"><span>Assigned videos</span><span className="font-medium text-ink">{assignedIds.size}</span></div>
+            <div className="flex justify-between"><span>Library total</span><span className="font-medium text-ink">{videos.length}</span></div>
+          </div>
         </Panel>
         <Panel className="p-0">
           <div className="grid gap-3 border-b border-border p-5 md:grid-cols-[minmax(0,1fr)_160px_170px]">
@@ -173,42 +225,74 @@ export default function ChildDetailPage() {
             </label>
             <span className="text-sm text-muted">{selected.size} selected</span>
             <div className="ml-auto flex gap-2">
-              <Button onClick={bulkAssign} disabled={busy || selected.size === 0}>Assign selected</Button>
-              <Button variant="secondary" onClick={bulkUnassign} disabled={busy || selected.size === 0}>Unassign selected</Button>
+              <Button onClick={bulkAssign} disabled={busy || selectedUnassigned === 0}>
+                <Plus size={15} /> Assign{selectedUnassigned > 0 ? ` ${selectedUnassigned}` : ""}
+              </Button>
+              <Button variant="danger" onClick={bulkUnassign} disabled={busy || selectedAssigned === 0}>
+                <Minus size={15} /> Unassign{selectedAssigned > 0 ? ` ${selectedAssigned}` : ""}
+              </Button>
             </div>
           </div>
+          {message && <p className="border-b border-border px-5 py-2 text-sm text-muted">{message}</p>}
           <div className="grid gap-3 p-5 sm:grid-cols-2 xl:grid-cols-3">
             {filteredVideos.map((video) => {
               const isAssigned = assignedIds.has(video.id);
               const isSelected = selected.has(video.id);
+              const hiddenOnIpad = isAssigned && (!video.approved || video.status !== "ready");
+              const tileBusy = busyVideoId === video.id;
               return (
-                <button
-                  type="button"
+                <div
                   key={video.id}
-                  onClick={() => toggle(video.id)}
-                  className={`group overflow-hidden rounded-ui border text-left transition ${isSelected ? "border-accent ring-2 ring-accent/40" : "border-border hover:border-accent/50"}`}
+                  className={`group overflow-hidden rounded-ui border transition ${isSelected ? "border-accent ring-2 ring-accent/40" : "border-border hover:border-accent/50"}`}
                 >
-                  <div className="relative aspect-video bg-muted/10">
+                  <button
+                    type="button"
+                    onClick={() => toggle(video.id)}
+                    aria-pressed={isSelected}
+                    aria-label={`${isSelected ? "Deselect" : "Select"} ${video.title}`}
+                    className="relative block aspect-video w-full bg-muted/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                  >
                     {video.thumbnail_url
                       ? <img src={video.thumbnail_url} alt="" className="h-full w-full object-cover" />
                       : <div className="flex h-full items-center justify-center"><ImageIcon size={24} className="text-muted" /></div>}
-                    <span className="absolute left-2 top-2 grid size-5 place-items-center rounded border border-border bg-panel">
-                      {isSelected && <CheckCircle2 size={16} className="text-accent" />}
+                    <span className={`absolute left-2 top-2 grid size-5 place-items-center rounded-md border bg-panel transition ${isSelected ? "border-accent bg-accent" : "border-border"}`}>
+                      {isSelected && <svg viewBox="0 0 16 16" className="size-3.5 fill-none stroke-panel stroke-2"><path d="M3.5 8.5l3 3 6-7" /></svg>}
                     </span>
-                    {isAssigned && <span className="absolute right-2 top-2 rounded bg-accent px-2 py-0.5 text-xs font-medium text-panel">Assigned</span>}
+                    {video.duration_seconds ? (
+                      <span className="absolute bottom-2 right-2 rounded-md bg-ink/80 px-1.5 py-0.5 text-xs font-medium tabular-nums text-panel">{formatDuration(video.duration_seconds)}</span>
+                    ) : null}
+                    {isAssigned && (
+                      <span className="absolute right-2 top-2 rounded-full bg-accent px-2 py-0.5 text-xs font-medium text-panel">Assigned</span>
+                    )}
+                  </button>
+                  <div className="grid gap-2 p-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-medium">{video.title}</div>
+                      <div className="text-sm text-muted">{video.status}{video.approved ? "" : " · not approved"}</div>
+                    </div>
+                    {hiddenOnIpad && (
+                      <p className="flex items-center gap-1.5 rounded-md bg-warn/10 px-2 py-1 text-xs text-ink">
+                        <EyeOff size={13} className="shrink-0" /> Hidden on iPad until approved and ready
+                      </p>
+                    )}
+                    {isAssigned ? (
+                      <Button variant="danger" className="min-h-8 w-full px-2.5 py-1 text-xs" disabled={tileBusy || busy} onClick={() => unassignOne(video.id)}>
+                        <Minus size={13} /> {tileBusy ? "Removing..." : "Unassign"}
+                      </Button>
+                    ) : (
+                      <Button className="min-h-8 w-full px-2.5 py-1 text-xs" disabled={tileBusy || busy} onClick={() => assignOne(video.id)}>
+                        <Plus size={13} /> {tileBusy ? "Adding..." : `Assign to ${profile?.name || "child"}`}
+                      </Button>
+                    )}
                   </div>
-                  <div className="p-3">
-                    <div className="truncate font-medium">{video.title}</div>
-                    <div className="text-sm text-muted">{video.status}{video.approved ? "" : " · not approved"}</div>
-                  </div>
-                </button>
+                </div>
               );
             })}
           </div>
           {filteredVideos.length === 0 && (
             <p className="p-5 text-sm text-muted">
               {assignFilter === "assigned"
-                ? "No videos assigned yet. Switch to “Not assigned” to add some."
+                ? "Nothing here yet. Switch the filter to “Not assigned” and pick some videos."
                 : "No matching videos."}
             </p>
           )}

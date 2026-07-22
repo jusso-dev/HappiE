@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { CheckCircle2, Circle, Grid2X2, ImageIcon, List, Plus } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { Badge, Button, Panel } from "@/components/ui";
-import { api, Video } from "@/lib/api";
+import { Badge, Button, ChildChip, Panel } from "@/components/ui";
+import { api, ChildProfile, Video } from "@/lib/api";
 
 function formatBytes(bytes?: number) {
   if (!bytes) return "No size";
@@ -21,13 +21,19 @@ function formatBytes(bytes?: number) {
 
 export default function VideosPage() {
   const [videos, setVideos] = useState<Video[]>([]);
+  const [children, setChildren] = useState<ChildProfile[]>([]);
   const [view, setView] = useState<"grid" | "list">("grid");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sourceFilter, setSourceFilter] = useState("all");
   const [approvalFilter, setApprovalFilter] = useState("all");
+  const [childFilter, setChildFilter] = useState("all");
   const [sort, setSort] = useState("created_desc");
-  useEffect(() => { api<Video[]>("/videos").then(setVideos).catch(() => {}); }, []);
+  useEffect(() => {
+    api<Video[]>("/videos").then(setVideos).catch(() => {});
+    api<ChildProfile[]>("/children").then(setChildren).catch(() => {});
+  }, []);
+  const childColors = useMemo(() => new Map(children.map((child) => [child.id, child.avatar_color])), [children]);
   const filteredVideos = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return [...videos]
@@ -36,7 +42,11 @@ export default function VideosPage() {
         return (!normalizedQuery || searchable.includes(normalizedQuery))
           && (statusFilter === "all" || video.status === statusFilter)
           && (sourceFilter === "all" || video.source_type === sourceFilter)
-          && (approvalFilter === "all" || (approvalFilter === "approved" ? video.approved : !video.approved));
+          && (approvalFilter === "all" || (approvalFilter === "approved" ? video.approved : !video.approved))
+          && (childFilter === "all"
+            || (childFilter === "unassigned"
+              ? (video.assignments || []).length === 0
+              : (video.assignments || []).some((a) => a.child_profile_id === childFilter)));
       })
       .sort((a, b) => {
         if (sort === "title_asc") return a.title.localeCompare(b.title);
@@ -45,7 +55,7 @@ export default function VideosPage() {
         if (sort === "size_asc") return (a.storage_bytes || a.file_size_bytes || 0) - (b.storage_bytes || b.file_size_bytes || 0);
         return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       });
-  }, [approvalFilter, query, sort, sourceFilter, statusFilter, videos]);
+  }, [approvalFilter, childFilter, query, sort, sourceFilter, statusFilter, videos]);
   const statuses = Array.from(new Set(videos.map((video) => video.status))).sort();
   const sources = Array.from(new Set(videos.map((video) => video.source_type))).sort();
   return (
@@ -61,8 +71,13 @@ export default function VideosPage() {
         </div>
       </div>
       <Panel className="mb-4">
-        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px_160px_160px_180px]">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_150px_140px_140px_150px_170px]">
           <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search videos" />
+          <select value={childFilter} onChange={(e) => setChildFilter(e.target.value)} aria-label="Filter by child">
+            <option value="all">All children</option>
+            {children.map((child) => <option key={child.id} value={child.id}>Assigned to {child.name}</option>)}
+            <option value="unassigned">Not assigned</option>
+          </select>
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label="Filter by status">
             <option value="all">All statuses</option>
             {statuses.map((status) => <option key={status} value={status}>{status}</option>)}
@@ -104,6 +119,12 @@ export default function VideosPage() {
                     {video.approved ? "Approved" : "Draft"}
                   </Badge>
                 </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(video.assignments || []).map((assignment) => (
+                    <ChildChip key={assignment.child_profile_id} name={assignment.child_name} color={childColors.get(assignment.child_profile_id)} />
+                  ))}
+                  {(video.assignments || []).length === 0 && <span className="text-xs text-muted">Not assigned to anyone yet</span>}
+                </div>
               </div>
             </Link>
           ))}
@@ -116,7 +137,17 @@ export default function VideosPage() {
               <div className="flex h-11 w-16 items-center justify-center overflow-hidden rounded-ui bg-ink/[0.07]">
                 {video.thumbnail_url ? <img src={video.thumbnail_url} alt="" className="h-full w-full object-cover" /> : <ImageIcon size={18} className="text-muted" />}
               </div>
-              <div className="min-w-0"><div className="truncate font-medium">{video.title}</div><div className="text-muted">{video.source_type} · {video.status}</div></div>
+              <div className="min-w-0">
+                <div className="truncate font-medium">{video.title}</div>
+                <div className="text-muted">{video.source_type} · {video.status}</div>
+                {(video.assignments || []).length > 0 && (
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    {(video.assignments || []).map((assignment) => (
+                      <ChildChip key={assignment.child_profile_id} name={assignment.child_name} color={childColors.get(assignment.child_profile_id)} />
+                    ))}
+                  </div>
+                )}
+              </div>
               <span className="text-muted">{formatBytes(video.storage_bytes || video.file_size_bytes)}</span>
               <span className="text-muted sm:col-start-2 lg:col-start-auto">{video.category_name || "Uncategorized"}</span>
               <span className="inline-flex items-center gap-1 text-muted sm:justify-self-end">

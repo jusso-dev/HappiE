@@ -60,3 +60,64 @@ export function Badge({
     />
   );
 }
+
+export function ProgressBar({
+  value,
+  tone = "accent",
+  label,
+  className,
+}: {
+  value: number;
+  tone?: "accent" | "danger" | "warn";
+  label?: string;
+  className?: string;
+}) {
+  const clamped = Math.max(0, Math.min(100, value));
+  return (
+    <div className={cn("flex items-center gap-3", className)}>
+      <div
+        role="progressbar"
+        aria-valuenow={Math.round(clamped)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={label || "Progress"}
+        className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-ink/10"
+      >
+        <div
+          className={cn(
+            "h-full rounded-full transition-[width] duration-500 ease-out",
+            tone === "accent" && "bg-accent",
+            tone === "danger" && "bg-danger",
+            tone === "warn" && "bg-warn"
+          )}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+      <span className="w-10 shrink-0 text-right text-xs font-medium tabular-nums text-muted">{Math.round(clamped)}%</span>
+    </div>
+  );
+}
+
+export function ChildAvatar({ name, color, size = "md" }: { name: string; color?: string; size?: "sm" | "md" }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "grid shrink-0 place-items-center rounded-full font-semibold text-panel",
+        size === "sm" ? "size-5 text-[10px]" : "size-9 text-sm"
+      )}
+      style={{ backgroundColor: color || "oklch(53% 0.13 154)" }}
+    >
+      {name.slice(0, 1).toUpperCase()}
+    </span>
+  );
+}
+
+export function ChildChip({ name, color }: { name: string; color?: string }) {
+  return (
+    <span className="inline-flex min-h-6 items-center gap-1.5 rounded-full border border-border bg-panel px-2 py-0.5 text-xs font-medium text-ink">
+      <ChildAvatar name={name} color={color} size="sm" />
+      {name}
+    </span>
+  );
+}

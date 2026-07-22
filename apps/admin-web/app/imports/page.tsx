@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { ExternalLink, RotateCcw, Search, Trash2, XCircle } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { Badge, Button, Panel } from "@/components/ui";
+import { Badge, Button, Panel, ProgressBar } from "@/components/ui";
 import { api, ImportJob } from "@/lib/api";
 
 const ACTIVE_STATUSES = new Set(["pending", "searching", "downloading", "processing", "uploading"]);
@@ -46,19 +46,29 @@ export default function ImportsPage() {
   const hasActiveJob = jobs.some((job) => ACTIVE_STATUSES.has(job.status));
 
   useEffect(() => {
-    const hasActiveJob = jobs.some((job) => ACTIVE_STATUSES.has(job.status));
     const timer = setInterval(() => load().catch(() => {}), hasActiveJob ? 1500 : 5000);
     return () => clearInterval(timer);
   }, [hasActiveJob]);
 
   async function cancelJob(id: string) {
-    await api(`/imports/${id}/cancel`, { method: "POST" });
-    await load();
+    setBusyJobId(id);
+    try {
+      await api(`/imports/${id}/cancel`, { method: "POST" });
+      await load();
+    } finally {
+      setBusyJobId(null);
+    }
   }
 
   async function deleteJob(id: string) {
-    await api(`/imports/${id}`, { method: "DELETE" });
-    await load();
+    if (!window.confirm("Delete this import job? Its history and diagnostics will be removed.")) return;
+    setBusyJobId(id);
+    try {
+      await api(`/imports/${id}`, { method: "DELETE" });
+      await load();
+    } finally {
+      setBusyJobId(null);
+    }
   }
 
   async function retryJob(id: string) {
@@ -114,7 +124,7 @@ export default function ImportsPage() {
               <div className="truncate font-medium">{job.source_url || job.query || job.id}</div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-muted">
                 <Badge tone={statusTone(job.status)}>{job.status}</Badge>
-                <span>{job.progress}% {job.error_message ? `· ${job.error_message}` : ""}</span>
+                {job.error_message && <span className="text-danger">{job.error_message}</span>}
                 {job.result_video_id && (
                   <Link className="inline-flex items-center gap-1 text-ink underline-offset-2 hover:underline" href={`/videos/${job.result_video_id}`}>
                     Open video <ExternalLink size={13} />
@@ -130,10 +140,10 @@ export default function ImportsPage() {
                 </Button>
               )}
               {!["completed", "failed", "cancelled"].includes(job.status) && (
-                <Button variant="secondary" className="w-full sm:w-auto" onClick={() => cancelJob(job.id)}><XCircle size={15} /> Cancel</Button>
+                <Button variant="secondary" className="w-full sm:w-auto" onClick={() => cancelJob(job.id)} disabled={busyJobId === job.id}><XCircle size={15} /> Cancel</Button>
               )}
               {!job.result_video_id && (
-                <Button variant="danger" className="w-full sm:w-auto" onClick={() => deleteJob(job.id)}><Trash2 size={15} /> Delete</Button>
+                <Button variant="danger" className="w-full sm:w-auto" onClick={() => deleteJob(job.id)} disabled={busyJobId === job.id}><Trash2 size={15} /> Delete</Button>
               )}
             </div>
           </div>
@@ -156,11 +166,11 @@ function ImportDiagnostics({ job }: { job: ImportJob }) {
   const output = Array.isArray(worker.last_output) ? worker.last_output.filter((line): line is string => typeof line === "string") : [];
   const hasDetails = step || detail || command || Object.keys(files).length > 0 || output.length > 0;
 
+  const barTone = job.status === "failed" || job.status === "cancelled" ? "danger" : "accent";
+
   return (
     <div className="mt-3 space-y-2">
-      <div className="h-2 overflow-hidden rounded-full bg-ink/10">
-        <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} />
-      </div>
+      <ProgressBar value={job.progress} tone={barTone} label={`Import progress: ${step || job.status}`} />
       {hasDetails && (
         <div className="soft-section p-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">

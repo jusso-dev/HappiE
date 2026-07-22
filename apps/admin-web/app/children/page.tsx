@@ -4,14 +4,25 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Save } from "lucide-react";
 import { Shell } from "@/components/shell";
-import { Button, Field, Panel } from "@/components/ui";
+import { Button, ChildAvatar, Field, Panel } from "@/components/ui";
 import { api, ChildProfile } from "@/lib/api";
+
+// Rotating playful identity colors so each child gets a distinct hue.
+const AVATAR_COLORS = [
+  "oklch(62% 0.14 170)",
+  "oklch(62% 0.15 260)",
+  "oklch(62% 0.15 320)",
+  "oklch(64% 0.14 70)",
+  "oklch(60% 0.15 25)",
+  "oklch(62% 0.13 220)",
+];
 
 export default function ChildrenPage() {
   const [children, setChildren] = useState<ChildProfile[]>([]);
   const [name, setName] = useState("");
   const [quotaByChild, setQuotaByChild] = useState<Record<string, string>>({});
   const [savingId, setSavingId] = useState("");
+  const [creating, setCreating] = useState(false);
   const [message, setMessage] = useState("");
   const [query, setQuery] = useState("");
   const [quotaFilter, setQuotaFilter] = useState("all");
@@ -27,9 +38,24 @@ export default function ChildrenPage() {
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    await api("/children", { method: "POST", body: JSON.stringify({ name, avatar_color: "oklch(72% 0.12 170)", storage_quota_mb: 8192 }) });
-    setName("");
-    await load();
+    setCreating(true);
+    setMessage("");
+    try {
+      await api("/children", {
+        method: "POST",
+        body: JSON.stringify({
+          name,
+          avatar_color: AVATAR_COLORS[children.length % AVATAR_COLORS.length],
+          storage_quota_mb: 8192,
+        }),
+      });
+      setName("");
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not create profile");
+    } finally {
+      setCreating(false);
+    }
   }
 
   async function saveQuota(child: ChildProfile) {
@@ -83,8 +109,8 @@ export default function ChildrenPage() {
       <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
         <Panel>
           <form onSubmit={create} className="grid gap-4">
-            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="H" required /></Field>
-            <Button>Create profile</Button>
+            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="H" required disabled={creating} /></Field>
+            <Button disabled={creating}>{creating ? "Creating..." : "Create profile"}</Button>
           </form>
         </Panel>
         <Panel className="p-0">
@@ -103,9 +129,12 @@ export default function ChildrenPage() {
           </div>
           {filteredChildren.map((child) => (
             <div key={child.id} className="grid gap-3 border-b border-border px-5 py-4 last:border-b-0 md:grid-cols-[1fr_220px_auto] md:items-center">
-              <Link href={`/children/${child.id}`} className="min-w-0 hover:underline">
-                <div className="font-medium">{child.name}</div>
-                <div className="text-sm text-muted">Open assigned library</div>
+              <Link href={`/children/${child.id}`} className="flex min-w-0 items-center gap-3">
+                <ChildAvatar name={child.name} color={child.avatar_color} />
+                <span className="min-w-0">
+                  <span className="block truncate font-medium hover:underline">{child.name}</span>
+                  <span className="block text-sm text-muted">Open assigned library</span>
+                </span>
               </Link>
               <Field label="iPad quota, MB">
                 <input
