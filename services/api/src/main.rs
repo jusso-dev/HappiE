@@ -999,7 +999,7 @@ async fn youtube_search(
             .ok_or_else(|| err("child profile not found"))?;
     }
     let has_assignments = !child_profile_ids.is_empty();
-    let row = sqlx::query("INSERT INTO import_jobs (provider, query, status, metadata) VALUES ('youtube',$1,'searching',$2) RETURNING *")
+    let row = sqlx::query("INSERT INTO import_jobs (provider, query, status, metadata) VALUES ('youtube',$1,'pending',$2) RETURNING *")
         .bind(req.query.trim()).bind(json!({
             "import_kind": "search",
             "max_videos": limit,
@@ -1161,7 +1161,9 @@ async fn delete_import(
 }
 
 async fn worker_next_import(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let row = sqlx::query("UPDATE import_jobs SET status='downloading', progress=5, updated_at=now() WHERE id = (SELECT id FROM import_jobs WHERE status IN ('pending','searching') OR (status IN ('downloading','processing','uploading') AND updated_at < now() - interval '15 minutes') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
+    // 'searching' is deliberately NOT a pickup status: a search job being
+    // processed must never be handed to a second worker loop.
+    let row = sqlx::query("UPDATE import_jobs SET status='downloading', progress=5, updated_at=now() WHERE id = (SELECT id FROM import_jobs WHERE status = 'pending' OR (status IN ('downloading','processing','uploading') AND updated_at < now() - interval '15 minutes') ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *")
         .fetch_optional(&state.db).await.map_err(|e| err(e.to_string()))?;
     Ok(Json(
         row.map(|r| row_to_json(&r)).unwrap_or_else(|| json!(null)),

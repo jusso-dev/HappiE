@@ -128,8 +128,33 @@ export default function YoutubeImportPage() {
                 The playlist job will read the playlist, create one import job per video, then each video will download, process, upload to R2, and inherit these child assignments.
               </div>
             )}
+            {error && <p className="rounded-ui border border-danger/25 bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p>}
+            <Button className="w-full sm:w-fit" disabled={isSubmitting || !trimmedUrl}>
+              {importKind === "playlist" ? <ListVideo size={16} /> : <LinkIcon size={16} />}
+              {isSubmitting ? "Creating job..." : importKind === "playlist" ? "Import playlist" : "Download and assign"}
+            </Button>
+          </form>
+        </Panel>
+        <Panel>
+          <form onSubmit={search} className="grid gap-4">
+            <Field label="Search YouTube"><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search terms" required /></Field>
+            <Field label="How many videos to import">
+              <input type="number" min={1} max={50} value={searchLimit} onChange={(e) => setSearchLimit(e.target.value)} required />
+            </Field>
+            <div className="soft-section p-3 text-sm text-muted">
+              Searches YouTube and automatically imports up to this many videos, skipping anything already in your library or import queue. Imported videos get the child assignments and download priority selected below.
+            </div>
+            {searchError && <p className="rounded-ui border border-danger/25 bg-danger/10 px-3 py-2 text-sm text-danger">{searchError}</p>}
+            <Button variant="secondary" className="w-full sm:w-fit" disabled={isSearching || !query.trim() || !searchLimitValid}>
+              <Search size={16} /> {isSearching ? "Queuing search..." : "Search and import"}
+            </Button>
+          </form>
+        </Panel>
+        <Panel className="lg:col-span-2">
+          <div className="grid gap-4">
             <div className="grid gap-2">
               <label>Assign to children</label>
+              <p className="text-sm text-muted">Applies to whichever import you run above: single video, playlist, or search. Assigned imports are auto-approved.</p>
               <div className="soft-section grid gap-2 p-3">
                 <input value={childQuery} onChange={(e) => setChildQuery(e.target.value)} placeholder="Search children" />
                 <div className="grid gap-2 sm:grid-cols-2">
@@ -161,27 +186,7 @@ export default function YoutubeImportPage() {
                 <option value="optional">Optional</option>
               </select>
             </Field>
-            {error && <p className="rounded-ui border border-danger/25 bg-danger/10 px-3 py-2 text-sm text-danger">{error}</p>}
-            <Button className="w-full sm:w-fit" disabled={isSubmitting || !trimmedUrl}>
-              {importKind === "playlist" ? <ListVideo size={16} /> : <LinkIcon size={16} />}
-              {isSubmitting ? "Creating job..." : importKind === "playlist" ? "Import playlist" : "Download and assign"}
-            </Button>
-          </form>
-        </Panel>
-        <Panel>
-          <form onSubmit={search} className="grid gap-4">
-            <Field label="Search YouTube"><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search terms" required /></Field>
-            <Field label="How many videos to import">
-              <input type="number" min={1} max={50} value={searchLimit} onChange={(e) => setSearchLimit(e.target.value)} required />
-            </Field>
-            <div className="soft-section p-3 text-sm text-muted">
-              Searches YouTube and automatically imports up to this many videos, skipping anything already in your library or import queue. Imported videos inherit the child assignments and download priority selected on the left.
-            </div>
-            {searchError && <p className="rounded-ui border border-danger/25 bg-danger/10 px-3 py-2 text-sm text-danger">{searchError}</p>}
-            <Button variant="secondary" className="w-full sm:w-fit" disabled={isSearching || !query.trim() || !searchLimitValid}>
-              <Search size={16} /> {isSearching ? "Queuing search..." : "Search and import"}
-            </Button>
-          </form>
+          </div>
         </Panel>
       </div>
     </Shell>

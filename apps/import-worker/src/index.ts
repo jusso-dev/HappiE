@@ -470,7 +470,9 @@ async function processJob(job: ImportJob) {
     }
 
     if (job.query && !job.source_url) {
-      job.status = "searching";
+      // Never report status "searching" mid-flight: it used to be in the
+      // worker pickup set, and a second worker loop would re-run the job.
+      job.status = "processing";
       const requested = Math.min(50, Math.max(1, metadataNumber(job, "max_videos") ?? 10));
       // Over-fetch so duplicate skips on the API side can still fill the quota.
       const fetchCount = Math.min(requested * 3, 60);
