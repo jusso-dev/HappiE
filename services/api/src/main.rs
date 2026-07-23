@@ -960,6 +960,11 @@ fn sanitize_filename(name: &str) -> String {
 #[derive(Deserialize)]
 struct YoutubeSearchInput {
     query: String,
+    limit: Option<i32>,
+    child_profile_id: Option<Uuid>,
+    child_profile_ids: Option<Vec<Uuid>>,
+    approve: Option<bool>,
+    download_priority: Option<String>,
 }
 
 #[utoipa::path(post, path = "/imports/youtube/search")]
@@ -970,8 +975,40 @@ async fn youtube_search(
     if req.query.trim().is_empty() {
         return Err(err("query is required"));
     }
+    let limit = req.limit.unwrap_or(10);
+    if !(1..=50).contains(&limit) {
+        return Err(err("limit must be between 1 and 50"));
+    }
+    if let Some(priority) = &req.download_priority {
+        if !["required", "normal", "optional"].contains(&priority.as_str()) {
+            return Err(err("invalid download priority"));
+        }
+    }
+    let child_profile_ids = req.child_profile_ids.unwrap_or_default();
+    let child_profile_ids = if child_profile_ids.is_empty() {
+        req.child_profile_id.map(|id| vec![id]).unwrap_or_default()
+    } else {
+        child_profile_ids
+    };
+    for child_id in &child_profile_ids {
+        sqlx::query("SELECT id FROM child_profiles WHERE id=$1 AND is_active=true")
+            .bind(child_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| err("child lookup failed"))?
+            .ok_or_else(|| err("child profile not found"))?;
+    }
+    let has_assignments = !child_profile_ids.is_empty();
     let row = sqlx::query("INSERT INTO import_jobs (provider, query, status, metadata) VALUES ('youtube',$1,'searching',$2) RETURNING *")
-        .bind(req.query.trim()).bind(json!({"legal_notice": "User is responsible for rights, platform terms, and copyright compliance."}))
+        .bind(req.query.trim()).bind(json!({
+            "import_kind": "search",
+            "max_videos": limit,
+            "child_profile_id": child_profile_ids.first(),
+            "child_profile_ids": child_profile_ids,
+            "approve": req.approve.unwrap_or(has_assignments),
+            "download_priority": req.download_priority.unwrap_or_else(|| "normal".into()),
+            "legal_notice": "User is responsible for rights, platform terms, and copyright compliance."
+        }))
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
     audit(
         &state.db,
@@ -1189,10 +1226,40 @@ async fn worker_create_playlist_items(
         .await
         .map_err(|_| err("playlist import not found"))?;
     let parent_metadata: Value = parent.get("metadata");
+    let max_videos = parent_metadata.get("max_videos").and_then(Value::as_i64);
     let mut created = Vec::new();
+    let mut skipped_duplicates: i64 = 0;
     for item in req.items {
+        if let Some(limit) = max_videos {
+            if created.len() as i64 >= limit {
+                break;
+            }
+        }
         if !item.url.starts_with("http") {
             continue;
+        }
+        let external_id = item
+            .external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(external_id) = external_id {
+            // A video is a duplicate when its YouTube id already appears in a
+            // stored video's source URL or in any live import job.
+            let duplicate: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM videos WHERE status <> 'archived' AND source_url IS NOT NULL AND strpos(source_url, $1) > 0)
+                 OR EXISTS(SELECT 1 FROM import_jobs WHERE id <> $2 AND status NOT IN ('failed','cancelled')
+                     AND (selected_external_id = $1 OR (source_url IS NOT NULL AND strpos(source_url, $1) > 0)))",
+            )
+            .bind(external_id)
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+            if duplicate {
+                skipped_duplicates += 1;
+                continue;
+            }
         }
         let metadata = json!({
             "title": item.title,
@@ -1216,7 +1283,7 @@ async fn worker_create_playlist_items(
         created.push(row_to_json(&row));
     }
     Ok(Json(
-        json!({ "created_count": created.len(), "items": created }),
+        json!({ "created_count": created.len(), "skipped_duplicates": skipped_duplicates, "items": created }),
     ))
 }
 

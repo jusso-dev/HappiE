@@ -16,12 +16,17 @@ export default function YoutubeImportPage() {
   const [childProfileIds, setChildProfileIds] = useState<string[]>([]);
   const [downloadPriority, setDownloadPriority] = useState("normal");
   const [query, setQuery] = useState("");
+  const [searchLimit, setSearchLimit] = useState("10");
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [childQuery, setChildQuery] = useState("");
   const [assignmentFilter, setAssignmentFilter] = useState("all");
   const [childSort, setChildSort] = useState("name_asc");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const trimmedUrl = url.trim();
+  const parsedSearchLimit = Number.parseInt(searchLimit, 10);
+  const searchLimitValid = Number.isFinite(parsedSearchLimit) && parsedSearchLimit >= 1 && parsedSearchLimit <= 50;
 
   useEffect(() => {
     api<ChildProfile[]>("/children").then(setChildren).catch(() => setChildren([]));
@@ -53,8 +58,25 @@ export default function YoutubeImportPage() {
 
   async function search(e: React.FormEvent) {
     e.preventDefault();
-    await api("/imports/youtube/search", { method: "POST", body: JSON.stringify({ query }) });
-    router.push("/imports");
+    setSearchError("");
+    setIsSearching(true);
+    try {
+      await api("/imports/youtube/search", {
+        method: "POST",
+        body: JSON.stringify({
+          query: query.trim(),
+          limit: parsedSearchLimit,
+          child_profile_ids: childProfileIds,
+          approve: childProfileIds.length > 0,
+          download_priority: downloadPriority,
+        }),
+      });
+      router.push("/imports");
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : "Search failed");
+    } finally {
+      setIsSearching(false);
+    }
   }
 
   function toggleChild(childId: string) {
@@ -78,7 +100,7 @@ export default function YoutubeImportPage() {
   return (
     <Shell>
       <h1 className="page-title">YouTube import</h1>
-      <p className="page-subtitle mb-6">Import one video, or queue every video from a playlist you are permitted to store.</p>
+      <p className="page-subtitle mb-6">Import one video, a whole playlist, or search YouTube and bulk-import the results you don&apos;t already have.</p>
       <div className="mb-6 flex gap-3 rounded-ui border border-warn/35 bg-warn/10 p-4 text-sm text-ink">
         <AlertTriangle size={18} className="mt-0.5 shrink-0" />
         <p>You are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law. HappiE is a private family media library, not a public video sharing service.</p>
@@ -149,7 +171,16 @@ export default function YoutubeImportPage() {
         <Panel>
           <form onSubmit={search} className="grid gap-4">
             <Field label="Search YouTube"><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search terms" required /></Field>
-            <Button variant="secondary" className="w-full sm:w-fit"><Search size={16} /> Queue search job</Button>
+            <Field label="How many videos to import">
+              <input type="number" min={1} max={50} value={searchLimit} onChange={(e) => setSearchLimit(e.target.value)} required />
+            </Field>
+            <div className="soft-section p-3 text-sm text-muted">
+              Searches YouTube and automatically imports up to this many videos, skipping anything already in your library or import queue. Imported videos inherit the child assignments and download priority selected on the left.
+            </div>
+            {searchError && <p className="rounded-ui border border-danger/25 bg-danger/10 px-3 py-2 text-sm text-danger">{searchError}</p>}
+            <Button variant="secondary" className="w-full sm:w-fit" disabled={isSearching || !query.trim() || !searchLimitValid}>
+              <Search size={16} /> {isSearching ? "Queuing search..." : "Search and import"}
+            </Button>
           </form>
         </Panel>
       </div>

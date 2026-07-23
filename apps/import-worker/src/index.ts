@@ -50,6 +50,7 @@ const videoCrf = Number(process.env.OPTIMIZED_VIDEO_CRF || "26");
 const videoPreset = process.env.OPTIMIZED_VIDEO_PRESET || "medium";
 const audioBitrate = process.env.OPTIMIZED_AUDIO_BITRATE || "96k";
 const bucket = process.env.R2_BUCKET || "happie";
+const workerToken = process.env.IMPORT_WORKER_TOKEN;
 const streamedYoutubeFormat = "b[height<=720][ext=mp4][vcodec!=none][acodec!=none][protocol=https]/b[height<=720][vcodec!=none][acodec!=none][protocol=https]";
 
 const s3 = new S3Client({
@@ -129,6 +130,11 @@ function metadataString(job: ImportJob, key: string) {
   return typeof value === "string" ? value : "";
 }
 
+function metadataNumber(job: ImportJob, key: string) {
+  const value = job.metadata?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function playlistEntryUrl(entry: PlaylistEntry) {
   if (entry.webpage_url?.startsWith("http")) return entry.webpage_url;
   if (entry.url?.startsWith("http")) return entry.url;
@@ -137,9 +143,26 @@ function playlistEntryUrl(entry: PlaylistEntry) {
   return "";
 }
 
+function entriesToItems(entries: PlaylistEntry[]) {
+  const seen = new Set<string>();
+  const items: { url: string; title?: string; external_id?: string; index: number }[] = [];
+  for (const [index, entry] of entries.entries()) {
+    const url = playlistEntryUrl(entry);
+    if (!url.startsWith("http")) continue;
+    const externalId = entry.id || entry.url || undefined;
+    if (externalId) {
+      if (seen.has(externalId)) continue;
+      seen.add(externalId);
+    }
+    items.push({ url, title: entry.title || undefined, external_id: externalId, index: index + 1 });
+  }
+  return items;
+}
+
 async function api<T>(pathName: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
+  if (workerToken) headers.set("X-Worker-Token", workerToken);
   const res = await fetch(`${apiBase}${pathName}`, { ...init, headers });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
@@ -299,7 +322,9 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     "-f", streamedYoutubeFormat,
     "-o", "-",
     videoUrl,
-  ], { timeout: 30 * 60_000, stdout: "pipe" });
+  // The media stream is consumed by FFmpeg below. Do not also buffer it in
+  // execa, which otherwise terminates imports once stdout exceeds 100 MB.
+  ], { timeout: 30 * 60_000, stdout: "pipe", buffer: false });
   const ffmpeg = execa("ffmpeg", [
     "-y",
     "-i", "pipe:0",
@@ -315,7 +340,7 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     "-movflags", "frag_keyframe+empty_moov+default_base_moof",
     "-f", "mp4",
     "pipe:1",
-  ], { timeout: 30 * 60_000, stdin: "pipe", stdout: "pipe" });
+  ], { timeout: 30 * 60_000, stdin: "pipe", stdout: "pipe", buffer: false });
 
   // FFmpeg's stderr time= counter against the known source duration is the only
   // live signal for this phase, which is the longest one in the whole import.
@@ -385,8 +410,8 @@ async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, t
     "-f", streamedYoutubeFormat,
     "-o", "-",
     videoUrl,
-  ], { timeout: 120_000, stdout: "pipe" });
-  const ffmpeg = execa("ffmpeg", ["-y", "-ss", "00:00:00.5", "-i", "pipe:0", "-frames:v", "1", thumbPath], { timeout: 120_000, stdin: "pipe" });
+  ], { timeout: 120_000, stdout: "pipe", buffer: false });
+  const ffmpeg = execa("ffmpeg", ["-y", "-ss", "00:00:00.5", "-i", "pipe:0", "-frames:v", "1", thumbPath], { timeout: 120_000, stdin: "pipe", buffer: false });
   attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, downloader);
   attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, ffmpeg);
   downloader.stdout?.pipe(ffmpeg.stdin!);
@@ -417,14 +442,7 @@ async function processJob(job: ImportJob) {
       }, "yt-dlp", args, 5 * 60_000);
       const playlist = JSON.parse(stdout);
       const entries = Array.isArray(playlist.entries) ? playlist.entries as PlaylistEntry[] : [];
-      const items = entries
-        .map((entry, index) => ({
-          url: playlistEntryUrl(entry),
-          title: entry.title || undefined,
-          external_id: entry.id || entry.url || undefined,
-          index: index + 1,
-        }))
-        .filter((item) => item.url.startsWith("http"));
+      const items = entriesToItems(entries);
       if (items.length === 0) {
         throw new Error("No importable videos were found in this playlist.");
       }
@@ -434,7 +452,7 @@ async function processJob(job: ImportJob) {
         source_url: job.source_url,
         files: { playlist_items: items.length },
       });
-      const result = await api<{ created_count: number }>(`/worker/imports/${job.id}/playlist-items`, {
+      const result = await api<{ created_count: number; skipped_duplicates: number }>(`/worker/imports/${job.id}/playlist-items`, {
         method: "POST",
         body: JSON.stringify({ items }),
       });
@@ -443,9 +461,9 @@ async function processJob(job: ImportJob) {
         progress: 100,
         metadata: mergeWorkerMetadata(job, {
           step: "Playlist queued",
-          detail: `${result.created_count} video imports created`,
+          detail: `${result.created_count} video imports created, ${result.skipped_duplicates} already in library`,
           source_url: job.source_url,
-          files: { playlist_items: items.length, queued_items: result.created_count },
+          files: { playlist_items: items.length, queued_items: result.created_count, skipped_duplicates: result.skipped_duplicates },
         }),
       });
       return;
@@ -453,16 +471,45 @@ async function processJob(job: ImportJob) {
 
     if (job.query && !job.source_url) {
       job.status = "searching";
-      await update(job.id, { status: "searching", progress: 20 });
-      const { stdout } = await runTracked(job, 20, { step: "Searching YouTube", detail: job.query }, "yt-dlp", [
+      const requested = Math.min(50, Math.max(1, metadataNumber(job, "max_videos") ?? 10));
+      // Over-fetch so duplicate skips on the API side can still fill the quota.
+      const fetchCount = Math.min(requested * 3, 60);
+      const { stdout } = await runTracked(job, 20, {
+        step: "Searching YouTube",
+        detail: `Looking for up to ${requested} new videos matching "${job.query}"`,
+      }, "yt-dlp", [
         "--js-runtimes", "node",
         "--remote-components", "ejs:github",
-        `ytsearch5:${job.query}`,
-        "--dump-json",
         "--flat-playlist",
-      ], 60_000);
-      const results = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
-      await update(job.id, { status: "completed", progress: 100, metadata: { results, note: "Select a result URL in the admin UI to create an import job." } });
+        "--dump-single-json",
+        `ytsearch${fetchCount}:${job.query}`,
+      ], 5 * 60_000);
+      const playlist = JSON.parse(stdout);
+      const entries = Array.isArray(playlist.entries) ? playlist.entries as PlaylistEntry[] : [];
+      const items = entriesToItems(entries);
+      if (items.length === 0) {
+        throw new Error("YouTube returned no results for this search.");
+      }
+      await updateDiagnostics(job, 65, {
+        step: "Creating video jobs",
+        detail: `${items.length} search results found, importing up to ${requested} new videos`,
+        files: { search_results: items.length, requested },
+      });
+      const result = await api<{ created_count: number; skipped_duplicates: number }>(`/worker/imports/${job.id}/playlist-items`, {
+        method: "POST",
+        body: JSON.stringify({ items }),
+      });
+      await update(job.id, {
+        status: "completed",
+        progress: 100,
+        metadata: mergeWorkerMetadata(job, {
+          step: "Search queued",
+          detail: result.created_count === 0
+            ? `All ${items.length} search results are already in the library or import queue`
+            : `${result.created_count} new video imports created, ${result.skipped_duplicates} duplicates skipped`,
+          files: { search_results: items.length, queued_items: result.created_count, skipped_duplicates: result.skipped_duplicates },
+        }),
+      });
       return;
     }
 
