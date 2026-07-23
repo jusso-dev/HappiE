@@ -1,12 +1,18 @@
+# Homelab deployment: pulls prebuilt images from GHCR instead of building.
+# Watchtower polls the registry and restarts services on new :latest images.
+#
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# If the GitHub repo is private, log in once so pulls (and Watchtower polls) work:
+#   docker login ghcr.io -u <github-user> -p <read:packages PAT>
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-happie}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-happie}
       POSTGRES_DB: ${POSTGRES_DB:-happie}
-    ports:
-      - "0.0.0.0:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -17,6 +23,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -43,51 +50,46 @@ services:
       "
 
   happie-api:
-    build:
-      context: .
-      dockerfile: services/api/Dockerfile
+    image: ghcr.io/jusso-dev/happie-api:latest
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     depends_on:
       postgres:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
     environment:
-      # In-network DSN: .env's DATABASE_URL points at the host-mapped port
-      # (localhost:55432) for tools run outside compose, which the container
-      # cannot reach - so it is intentionally not passed through here.
       DATABASE_URL: postgres://${POSTGRES_USER:-happie}:${POSTGRES_PASSWORD:-happie}@postgres:5432/${POSTGRES_DB:-happie}
       R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-minioadmin}
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
       R2_BUCKET: ${R2_BUCKET:-happie}
       R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
       PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-http://localhost:18080}
-      MAX_IMPORT_FILE_SIZE_MB: 2048
+      MAX_IMPORT_FILE_SIZE_MB: ${MAX_IMPORT_FILE_SIZE_MB:-2048}
+      OPTIMIZED_VIDEO_MAX_HEIGHT: ${OPTIMIZED_VIDEO_MAX_HEIGHT:-720}
+      OPTIMIZED_VIDEO_CRF: ${OPTIMIZED_VIDEO_CRF:-26}
       OPTIMIZED_VIDEO_PRESET: ${OPTIMIZED_VIDEO_PRESET:-medium}
+      OPTIMIZED_AUDIO_BITRATE: ${OPTIMIZED_AUDIO_BITRATE:-96k}
       RUST_LOG: info
     ports:
       - "0.0.0.0:18080:8080"
 
   admin-web:
-    build:
-      context: .
-      dockerfile: apps/admin-web/Dockerfile
-      target: dev
+    image: ghcr.io/jusso-dev/happie-admin-web:latest
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     depends_on:
       - happie-api
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:18080}
-      NEXT_ALLOWED_DEV_ORIGINS: ${NEXT_ALLOWED_DEV_ORIGINS:-}
     ports:
       - "0.0.0.0:5500:3000"
-    volumes:
-      - ./apps/admin-web:/app/apps/admin-web
-      - admin-node-modules:/app/apps/admin-web/node_modules
 
   import-worker:
-    build:
-      context: .
-      dockerfile: apps/import-worker/Dockerfile
-      target: dev
+    image: ghcr.io/jusso-dev/happie-import-worker:latest
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     depends_on:
       - happie-api
       - minio-init
@@ -97,16 +99,24 @@ services:
       R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-minioadmin}
       R2_BUCKET: ${R2_BUCKET:-happie}
       R2_ENDPOINT: ${R2_ENDPOINT:-http://minio:9000}
-      MAX_IMPORT_FILE_SIZE_MB: 2048
+      MAX_IMPORT_FILE_SIZE_MB: ${MAX_IMPORT_FILE_SIZE_MB:-2048}
       MAX_CONCURRENT_IMPORTS: ${MAX_CONCURRENT_IMPORTS:-2}
       YTDLP_CONCURRENT_FRAGMENTS: ${YTDLP_CONCURRENT_FRAGMENTS:-4}
+      OPTIMIZED_VIDEO_MAX_HEIGHT: ${OPTIMIZED_VIDEO_MAX_HEIGHT:-720}
+      OPTIMIZED_VIDEO_CRF: ${OPTIMIZED_VIDEO_CRF:-26}
       OPTIMIZED_VIDEO_PRESET: ${OPTIMIZED_VIDEO_PRESET:-medium}
+      OPTIMIZED_AUDIO_BITRATE: ${OPTIMIZED_AUDIO_BITRATE:-96k}
+      NODE_OPTIONS: ${IMPORT_WORKER_NODE_OPTIONS:-}
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
     volumes:
-      - ./apps/import-worker:/app/apps/import-worker
-      - worker-node-modules:/app/apps/import-worker/node_modules
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Reuse the host's registry login for private GHCR pulls.
+      - ${DOCKER_CONFIG_JSON:-~/.docker/config.json}:/config.json:ro
+    command: --label-enable --cleanup --interval ${WATCHTOWER_INTERVAL_SECONDS:-300}
 
 volumes:
   postgres-data:
   minio-data:
-  admin-node-modules:
-  worker-node-modules:
