@@ -113,8 +113,8 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Reuse the host's registry login for private GHCR pulls.
-      - ${DOCKER_CONFIG_JSON:-~/.docker/config.json}:/config.json:ro
+    # If the GHCR packages ever become private, docker-login on the host and
+    # add a bind mount of ~/.docker/config.json to /config.json:ro here.
     command: --label-enable --cleanup --interval ${WATCHTOWER_INTERVAL_SECONDS:-300}
 
 volumes:
