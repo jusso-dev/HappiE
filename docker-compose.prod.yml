@@ -111,6 +111,10 @@ services:
   watchtower:
     image: containrrr/watchtower:latest
     restart: unless-stopped
+    environment:
+      # Watchtower's bundled client defaults to Docker API 1.25; modern
+      # daemons (Docker 25+) refuse anything below 1.40.
+      DOCKER_API_VERSION: "1.44"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     # If the GHCR packages ever become private, docker-login on the host and
