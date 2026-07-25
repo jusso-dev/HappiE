@@ -6,7 +6,7 @@ product
 
 ## Users
 
-Two parents managing a private, LAN-only video library for their kids (H and E). They upload or import videos, approve them, and assign them to each child's iPad library. Sessions are short, task-driven: "get this video onto H's iPad", "check the import finished", "clean out storage". No public users, no auth, trusted home network.
+Parents managing a private, LAN-only video library for their children. They upload or import videos, approve them, and assign them to each child's iPad library. Sessions are short and task-driven: "get this video onto the kids' iPads", "check the import finished", "clean out storage". No public users, no auth, trusted home network.
 
 ## Product Purpose
 

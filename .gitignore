@@ -17,6 +17,8 @@ coverage/
 .cache/
 **/.cache/
 .turbo/
+secrets/*
+!secrets/.gitkeep
 
 .DS_Store
 npm-debug.log*

@@ -100,10 +100,12 @@ services:
       MAX_IMPORT_FILE_SIZE_MB: 2048
       MAX_CONCURRENT_IMPORTS: ${MAX_CONCURRENT_IMPORTS:-2}
       YTDLP_CONCURRENT_FRAGMENTS: ${YTDLP_CONCURRENT_FRAGMENTS:-4}
+      YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-}
       OPTIMIZED_VIDEO_PRESET: ${OPTIMIZED_VIDEO_PRESET:-medium}
     volumes:
       - ./apps/import-worker:/app/apps/import-worker
       - worker-node-modules:/app/apps/import-worker/node_modules
+      - ./secrets:/run/secrets/happie:ro
 
 volumes:
   postgres-data:

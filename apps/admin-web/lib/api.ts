@@ -82,6 +82,22 @@ export type ImportJob = {
   created_at: string;
 };
 
+export type YoutubeSearchResult = {
+  id: string;
+  title: string;
+  url: string;
+  thumbnail_url?: string;
+  channel?: string;
+  duration_seconds?: number;
+  view_count?: number;
+};
+
+export type SearchImportResponse = {
+  created_count: number;
+  skipped_duplicates: number;
+  items: ImportJob[];
+};
+
 export type StorageBreakdown = {
   kind?: string;
   source_type?: string;

@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::HashSet, env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
@@ -77,6 +77,7 @@ fn err(msg: impl Into<String>) -> ApiError {
         presign_upload,
         complete_upload,
         youtube_search,
+        youtube_search_import,
         youtube_url,
         storage_summary,
         get_import,
@@ -141,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/uploads/direct", post(direct_upload))
         .route("/storage/summary", get(storage_summary))
         .route("/imports/youtube/search", post(youtube_search))
+        .route(
+            "/imports/youtube/search/:id/import",
+            post(youtube_search_import),
+        )
         .route("/imports/youtube/url", post(youtube_url))
         .route("/imports", get(list_imports))
         .route("/imports/:id", get(get_import).delete(delete_import))
@@ -1022,6 +1027,143 @@ async fn youtube_search(
 }
 
 #[derive(Deserialize)]
+struct YoutubeSearchImportInput {
+    selected_external_ids: Vec<String>,
+    child_profile_id: Option<Uuid>,
+    child_profile_ids: Option<Vec<Uuid>>,
+    approve: Option<bool>,
+    download_priority: Option<String>,
+}
+
+#[utoipa::path(post, path = "/imports/youtube/search/{id}/import")]
+async fn youtube_search_import(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<YoutubeSearchImportInput>,
+) -> ApiResult<Json<Value>> {
+    let selected_ids = req
+        .selected_external_ids
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+    if selected_ids.is_empty() {
+        return Err(err("select at least one video"));
+    }
+    if selected_ids.len() > 50 {
+        return Err(err("no more than 50 videos can be imported at once"));
+    }
+    if let Some(priority) = &req.download_priority {
+        if !["required", "normal", "optional"].contains(&priority.as_str()) {
+            return Err(err("invalid download priority"));
+        }
+    }
+
+    let child_profile_ids = req.child_profile_ids.unwrap_or_default();
+    let child_profile_ids = if child_profile_ids.is_empty() {
+        req.child_profile_id
+            .map(|child_id| vec![child_id])
+            .unwrap_or_default()
+    } else {
+        child_profile_ids
+    };
+    for child_id in &child_profile_ids {
+        sqlx::query("SELECT id FROM child_profiles WHERE id=$1 AND is_active=true")
+            .bind(child_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| err("child lookup failed"))?
+            .ok_or_else(|| err("child profile not found"))?;
+    }
+
+    let parent = sqlx::query(
+        "SELECT status, metadata FROM import_jobs
+         WHERE id=$1 AND provider='youtube' AND query IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| err("search lookup failed"))?
+    .ok_or_else(|| err("search not found"))?;
+    let status: String = parent.get("status");
+    if status != "completed" {
+        return Err(err("search results are not ready yet"));
+    }
+    let mut parent_metadata: Value = parent.get("metadata");
+    let results = parent_metadata
+        .get("search_results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| err("search results are no longer available"))?;
+
+    let mut matched = HashSet::new();
+    let mut items = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        let Some(external_id) = result.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !selected_ids.contains(external_id) || matched.contains(external_id) {
+            continue;
+        }
+        let Some(url) = result.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !url.starts_with("http") {
+            continue;
+        }
+        matched.insert(external_id.to_owned());
+        items.push(PlaylistItemInput {
+            url: url.to_owned(),
+            title: result
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            external_id: Some(external_id.to_owned()),
+            index: Some(index as i32 + 1),
+        });
+    }
+    if matched.len() != selected_ids.len() {
+        return Err(err(
+            "one or more selected videos are no longer in these results",
+        ));
+    }
+
+    let has_assignments = !child_profile_ids.is_empty();
+    let priority = req.download_priority.unwrap_or_else(|| "normal".into());
+    let Value::Object(metadata) = &mut parent_metadata else {
+        return Err(err("search metadata is invalid"));
+    };
+    metadata.insert(
+        "child_profile_id".into(),
+        json!(child_profile_ids.first().copied()),
+    );
+    metadata.insert("child_profile_ids".into(), json!(child_profile_ids));
+    metadata.insert(
+        "approve".into(),
+        json!(req.approve.unwrap_or(has_assignments)),
+    );
+    metadata.insert("download_priority".into(), json!(priority));
+    metadata.insert("selected_count".into(), json!(items.len()));
+
+    sqlx::query("UPDATE import_jobs SET metadata=$2, updated_at=now() WHERE id=$1")
+        .bind(id)
+        .bind(&parent_metadata)
+        .execute(&state.db)
+        .await
+        .map_err(|_| err("search selection could not be saved"))?;
+
+    let result = create_import_jobs_from_items(&state, id, &parent_metadata, items).await?;
+    audit(
+        &state.db,
+        "import_search_selection",
+        "import_job",
+        Some(id),
+        json!({ "selected_count": selected_ids.len() }),
+    )
+    .await;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
 struct YoutubeUrlInput {
     url: String,
     title: Option<String>,
@@ -1228,10 +1370,20 @@ async fn worker_create_playlist_items(
         .await
         .map_err(|_| err("playlist import not found"))?;
     let parent_metadata: Value = parent.get("metadata");
+    let result = create_import_jobs_from_items(&state, id, &parent_metadata, req.items).await?;
+    Ok(Json(result))
+}
+
+async fn create_import_jobs_from_items(
+    state: &AppState,
+    parent_id: Uuid,
+    parent_metadata: &Value,
+    items: Vec<PlaylistItemInput>,
+) -> ApiResult<Value> {
     let max_videos = parent_metadata.get("max_videos").and_then(Value::as_i64);
     let mut created = Vec::new();
     let mut skipped_duplicates: i64 = 0;
-    for item in req.items {
+    for item in items {
         if let Some(limit) = max_videos {
             if created.len() as i64 >= limit {
                 break;
@@ -1244,8 +1396,30 @@ async fn worker_create_playlist_items(
             .external_id
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if let Some(external_id) = external_id {
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let metadata = json!({
+            "title": item.title,
+            "child_profile_id": parent_metadata.get("child_profile_id"),
+            "child_profile_ids": parent_metadata.get("child_profile_ids").cloned().unwrap_or_else(|| json!([])),
+            "approve": parent_metadata.get("approve").and_then(Value::as_bool).unwrap_or(false),
+            "download_priority": parent_metadata.get("download_priority").and_then(Value::as_str).unwrap_or("normal"),
+            "import_kind": "video",
+            "parent_import_id": parent_id,
+            "parent_import_kind": parent_metadata.get("import_kind").and_then(Value::as_str).unwrap_or("playlist"),
+            "playlist_external_id": external_id,
+            "playlist_index": item.index,
+            "legal_notice": "User is responsible for rights, platform terms, and copyright compliance."
+        });
+        let row = if let Some(external_id) = external_id.as_deref() {
+            let mut tx = state.db.begin().await.map_err(|e| err(e.to_string()))?;
+            // Serialize claims for the same YouTube id so concurrent browser
+            // submissions cannot both pass the duplicate check.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(external_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| err(e.to_string()))?;
             // A video is a duplicate when its YouTube id already appears in a
             // stored video's source URL or in any live import job.
             let duplicate: bool = sqlx::query_scalar(
@@ -1254,39 +1428,37 @@ async fn worker_create_playlist_items(
                      AND (selected_external_id = $1 OR (source_url IS NOT NULL AND strpos(source_url, $1) > 0)))",
             )
             .bind(external_id)
-            .bind(id)
-            .fetch_one(&state.db)
+            .bind(parent_id)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| err(e.to_string()))?;
             if duplicate {
+                tx.rollback().await.map_err(|e| err(e.to_string()))?;
                 skipped_duplicates += 1;
                 continue;
             }
-        }
-        let metadata = json!({
-            "title": item.title,
-            "child_profile_id": parent_metadata.get("child_profile_id"),
-            "child_profile_ids": parent_metadata.get("child_profile_ids").cloned().unwrap_or_else(|| json!([])),
-            "approve": parent_metadata.get("approve").and_then(Value::as_bool).unwrap_or(false),
-            "download_priority": parent_metadata.get("download_priority").and_then(Value::as_str).unwrap_or("normal"),
-            "import_kind": "video",
-            "playlist_parent_id": id,
-            "playlist_external_id": item.external_id,
-            "playlist_index": item.index,
-            "legal_notice": "User is responsible for rights, platform terms, and copyright compliance."
-        });
-        let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, selected_external_id, status, metadata) VALUES ('youtube',$1,$2,'pending',$3) RETURNING *")
-            .bind(item.url)
-            .bind(item.external_id)
-            .bind(metadata)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| err(e.to_string()))?;
+            let row = sqlx::query("INSERT INTO import_jobs (provider, source_url, selected_external_id, status, metadata) VALUES ('youtube',$1,$2,'pending',$3) RETURNING *")
+                .bind(&item.url)
+                .bind(external_id)
+                .bind(&metadata)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| err(e.to_string()))?;
+            tx.commit().await.map_err(|e| err(e.to_string()))?;
+            row
+        } else {
+            sqlx::query("INSERT INTO import_jobs (provider, source_url, selected_external_id, status, metadata) VALUES ('youtube',$1,NULL,'pending',$2) RETURNING *")
+                .bind(&item.url)
+                .bind(&metadata)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| err(e.to_string()))?
+        };
         created.push(row_to_json(&row));
     }
-    Ok(Json(
+    Ok(
         json!({ "created_count": created.len(), "skipped_duplicates": skipped_duplicates, "items": created }),
-    ))
+    )
 }
 
 async fn worker_update_import(

@@ -42,13 +42,38 @@ HappiE is LAN-local and does not have a login screen. Open the admin UI directly
 
 ## Admin Workflows
 
-1. Create child profiles at `/children`, for example `H` and `E`.
+1. Create one child profile per child at `/children`.
 2. Upload a private video at `/videos/new`.
 3. Open a video detail page, approve it, and assign it to one or more child profiles.
 4. Import user-supplied YouTube content from `/imports/youtube`.
 5. Watch import progress at `/imports`.
 
 The admin UI displays a legal warning for YouTube imports: users are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law.
+
+YouTube search is a review flow. A search first returns video titles, channels, durations, and thumbnails. The parent selects the wanted results, then starts those imports explicitly.
+
+### Members-only YouTube videos
+
+Members-only videos require cookies from a YouTube account that can play the video in the browser. Any Google account works for public videos, but a members-only video requires that exact account to hold the relevant channel membership. A dedicated account is a sensible choice if you do not want to use a personal account. Do not paste a raw `Cookie` header into the command or commit cookies to this repository.
+
+HappiE intentionally does not collect Google credentials or embed a Google sign-in screen. A Google OAuth token is not a substitute for the authenticated browser session that `yt-dlp` needs for members-only playback. The local, read-only cookie file keeps that session material outside the app database and can be removed at any time to revoke access.
+
+1. Open a single private or incognito browser window and sign in to the entitled YouTube account.
+2. In that same tab, open `https://www.youtube.com/robots.txt`.
+3. Export only the `youtube.com` cookies in Netscape cookie-file format to `secrets/youtube-cookies.txt`, then close the private window. The first line must be `# Netscape HTTP Cookie File` or `# HTTP Cookie File`.
+4. Set this in the local `.env`:
+
+   ```dotenv
+   YTDLP_COOKIES_FILE=/run/secrets/happie/youtube-cookies.txt
+   ```
+
+5. Recreate the worker so it receives the setting:
+
+   ```bash
+   docker compose up -d --build --force-recreate import-worker
+   ```
+
+The `secrets` directory is mounted read-only into the worker and ignored by Git. Treat the cookie file like a password. YouTube may invalidate it, in which case repeat the export with a fresh private session. Using an account with `yt-dlp` can also carry account suspension risk, so keep request volume modest.
 
 ## Storage
 
@@ -86,6 +111,7 @@ Key endpoints:
 - `POST /watch-progress`
 - `POST /uploads/direct` (transcodes to optimized MP4 and stores no original)
 - `POST /imports/youtube/search`
+- `POST /imports/youtube/search/:id/import`
 - `POST /imports/youtube/url`
 - `GET /imports/:id`
 - `POST /imports/:id/cancel`

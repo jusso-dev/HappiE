@@ -32,6 +32,22 @@ type PlaylistEntry = {
   title?: string;
   url?: string;
   webpage_url?: string;
+  thumbnail?: string;
+  thumbnails?: { url?: string }[];
+  channel?: string;
+  uploader?: string;
+  duration?: number;
+  view_count?: number;
+};
+
+type YoutubeSearchResult = {
+  id: string;
+  title: string;
+  url: string;
+  thumbnail_url?: string;
+  channel?: string;
+  duration_seconds?: number;
+  view_count?: number;
 };
 
 type YoutubeMediaInfo = {
@@ -51,6 +67,7 @@ const videoPreset = process.env.OPTIMIZED_VIDEO_PRESET || "medium";
 const audioBitrate = process.env.OPTIMIZED_AUDIO_BITRATE || "96k";
 const bucket = process.env.R2_BUCKET || "happie";
 const workerToken = process.env.IMPORT_WORKER_TOKEN;
+const ytdlpCookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
 const streamedYoutubeFormat = "b[height<=720][ext=mp4][vcodec!=none][acodec!=none][protocol=https]/b[height<=720][vcodec!=none][acodec!=none][protocol=https]";
 
 const s3 = new S3Client({
@@ -109,7 +126,7 @@ function mergeWorkerMetadata(job: ImportJob, diagnostics: Diagnostics) {
 function rememberOutput(lines: string[], chunk: Buffer | string) {
   const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
   for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
+    const trimmed = sanitizeDiagnosticText(line).trim();
     if (!trimmed) continue;
     lines.push(trimmed);
   }
@@ -135,12 +152,57 @@ function metadataNumber(job: ImportJob, key: string) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function withYtDlpAuth(args: string[]) {
+  return ytdlpCookiesFile ? ["--cookies", ytdlpCookiesFile, ...args] : args;
+}
+
+function redactCommandArgs(args: string[]) {
+  return args.map((arg, index) => (index > 0 && args[index - 1] === "--cookies" ? "[redacted]" : arg));
+}
+
+function sanitizeDiagnosticText(value: string) {
+  let sanitized = value.replace(
+    /(--cookies(?:=|\s+))(?:"[^"]*"|'[^']*'|\S+)/gi,
+    "$1[redacted]",
+  );
+  if (ytdlpCookiesFile) {
+    sanitized = sanitized.split(ytdlpCookiesFile).join("[cookie file]");
+  }
+  return sanitized.slice(0, 2_000);
+}
+
 function playlistEntryUrl(entry: PlaylistEntry) {
   if (entry.webpage_url?.startsWith("http")) return entry.webpage_url;
   if (entry.url?.startsWith("http")) return entry.url;
   if (entry.id) return `https://www.youtube.com/watch?v=${entry.id}`;
   if (entry.url) return `https://www.youtube.com/watch?v=${entry.url}`;
   return "";
+}
+
+function entriesToSearchResults(entries: PlaylistEntry[], limit: number): YoutubeSearchResult[] {
+  const seen = new Set<string>();
+  const results: YoutubeSearchResult[] = [];
+  for (const entry of entries) {
+    const id = entry.id?.trim();
+    if (!id || seen.has(id)) continue;
+    const url = playlistEntryUrl(entry);
+    if (!url.startsWith("http")) continue;
+    seen.add(id);
+    const thumbnail = entry.thumbnail
+      || [...(entry.thumbnails || [])].reverse().find((item) => item.url)?.url
+      || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
+    results.push({
+      id,
+      title: entry.title?.trim() || "Untitled video",
+      url,
+      thumbnail_url: thumbnail,
+      channel: entry.channel?.trim() || entry.uploader?.trim() || undefined,
+      duration_seconds: Number.isFinite(entry.duration) ? Math.round(Number(entry.duration)) : undefined,
+      view_count: Number.isFinite(entry.view_count) ? Math.round(Number(entry.view_count)) : undefined,
+    });
+    if (results.length >= limit) break;
+  }
+  return results;
 }
 
 function entriesToItems(entries: PlaylistEntry[]) {
@@ -201,14 +263,15 @@ async function runTracked(
   args: string[],
   timeout: number,
 ) {
+  const effectiveArgs = command === "yt-dlp" ? withYtDlpAuth(args) : args;
   const output: string[] = [];
   const startedAt = now();
   await updateDiagnostics(job, progress, {
     ...diagnostics,
-    command: `${command} ${args.map((arg) => (arg.includes(" ") ? `'${arg}'` : arg)).join(" ")}`,
+    command: `${command} ${redactCommandArgs(effectiveArgs).map((arg) => (arg.includes(" ") ? `'${arg}'` : arg)).join(" ")}`,
     last_output: output,
   });
-  const subprocess = execa(command, args, { timeout });
+  const subprocess = execa(command, effectiveArgs, { timeout });
   subprocess.stdout?.on("data", (chunk) => {
     rememberOutput(output, chunk);
     void updateDiagnostics(job, progress, { ...diagnostics, last_output: output, timings: { elapsed_seconds: secondsSince(startedAt) } }).catch(() => {});
@@ -313,7 +376,7 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
   const startedAt = now();
   await updateDiagnostics(job, TRANSCODE_PROGRESS_START, { ...diagnostics, last_output: output });
 
-  const downloader = execa("yt-dlp", [
+  const downloader = execa("yt-dlp", withYtDlpAuth([
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
     "--no-playlist",
@@ -324,7 +387,7 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     videoUrl,
   // The media stream is consumed by FFmpeg below. Do not also buffer it in
   // execa, which otherwise terminates imports once stdout exceeds 100 MB.
-  ], { timeout: 30 * 60_000, stdout: "pipe", buffer: false });
+  ]), { timeout: 30 * 60_000, stdout: "pipe", buffer: false });
   const ffmpeg = execa("ffmpeg", [
     "-y",
     "-i", "pipe:0",
@@ -401,7 +464,7 @@ async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, t
   };
   const startedAt = now();
   await updateDiagnostics(job, 68, { ...diagnostics, last_output: output });
-  const downloader = execa("yt-dlp", [
+  const downloader = execa("yt-dlp", withYtDlpAuth([
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
     "--no-playlist",
@@ -410,7 +473,7 @@ async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, t
     "-f", streamedYoutubeFormat,
     "-o", "-",
     videoUrl,
-  ], { timeout: 120_000, stdout: "pipe", buffer: false });
+  ]), { timeout: 120_000, stdout: "pipe", buffer: false });
   const ffmpeg = execa("ffmpeg", ["-y", "-ss", "00:00:00.5", "-i", "pipe:0", "-frames:v", "1", thumbPath], { timeout: 120_000, stdin: "pipe", buffer: false });
   attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, downloader);
   attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, ffmpeg);
@@ -474,8 +537,7 @@ async function processJob(job: ImportJob) {
       // worker pickup set, and a second worker loop would re-run the job.
       job.status = "processing";
       const requested = Math.min(50, Math.max(1, metadataNumber(job, "max_videos") ?? 10));
-      // Over-fetch so duplicate skips on the API side can still fill the quota.
-      const fetchCount = Math.min(requested * 3, 60);
+      const fetchCount = requested;
       const { stdout } = await runTracked(job, 20, {
         step: "Searching YouTube",
         detail: `Looking for up to ${requested} new videos matching "${job.query}"`,
@@ -488,28 +550,21 @@ async function processJob(job: ImportJob) {
       ], 5 * 60_000);
       const playlist = JSON.parse(stdout);
       const entries = Array.isArray(playlist.entries) ? playlist.entries as PlaylistEntry[] : [];
-      const items = entriesToItems(entries);
-      if (items.length === 0) {
+      const results = entriesToSearchResults(entries, requested);
+      if (results.length === 0) {
         throw new Error("YouTube returned no results for this search.");
       }
-      await updateDiagnostics(job, 65, {
-        step: "Creating video jobs",
-        detail: `${items.length} search results found, importing up to ${requested} new videos`,
-        files: { search_results: items.length, requested },
-      });
-      const result = await api<{ created_count: number; skipped_duplicates: number }>(`/worker/imports/${job.id}/playlist-items`, {
-        method: "POST",
-        body: JSON.stringify({ items }),
-      });
+      job.metadata = {
+        ...(job.metadata || {}),
+        search_results: results,
+      };
       await update(job.id, {
         status: "completed",
         progress: 100,
         metadata: mergeWorkerMetadata(job, {
-          step: "Search queued",
-          detail: result.created_count === 0
-            ? `All ${items.length} search results are already in the library or import queue`
-            : `${result.created_count} new video imports created, ${result.skipped_duplicates} duplicates skipped`,
-          files: { search_results: items.length, queued_items: result.created_count, skipped_duplicates: result.skipped_duplicates },
+          step: "Results ready",
+          detail: `${results.length} videos ready to review`,
+          files: { search_results: results.length, requested },
         }),
       });
       return;
@@ -610,13 +665,14 @@ async function processJob(job: ImportJob) {
       }),
     });
   } catch (error) {
+    const errorMessage = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
     await update(job.id, {
       status: "failed",
       progress: 100,
-      error_message: error instanceof Error ? error.message : String(error),
+      error_message: errorMessage,
       metadata: mergeWorkerMetadata(job, {
         step: "Failed",
-        detail: error instanceof Error ? error.message : String(error),
+        detail: errorMessage,
       }),
     }).catch(() => {});
   } finally {
