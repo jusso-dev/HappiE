@@ -98,6 +98,24 @@ export type SearchImportResponse = {
   items: ImportJob[];
 };
 
+export type VideoSource = {
+  id: string;
+  name: string;
+  provider: "youtube";
+  source_url: string;
+  cron_schedule: string;
+  enabled: boolean;
+  auto_approve: boolean;
+  download_priority: string;
+  max_videos_per_poll: number;
+  child_profile_ids: string[];
+  child_names: string[];
+  last_polled_at?: string;
+  next_poll_at: string;
+  last_error?: string;
+  created_at: string;
+};
+
 export type StorageBreakdown = {
   kind?: string;
   source_type?: string;

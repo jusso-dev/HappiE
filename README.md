@@ -46,11 +46,18 @@ HappiE is LAN-local and does not have a login screen. Open the admin UI directly
 2. Upload a private video at `/videos/new`.
 3. Open a video detail page, approve it, and assign it to one or more child profiles.
 4. Import user-supplied YouTube content from `/imports/youtube`.
-5. Watch import progress at `/imports`.
+5. Add a trusted YouTube channel or playlist at `/imports/sources` to poll it automatically.
+6. Watch import progress at `/imports`.
 
 The admin UI displays a legal warning for YouTube imports: users are responsible for having the right to download, store, and import content, and for complying with platform terms and copyright law.
 
 YouTube search is a review flow. A search first returns video titles, channels, durations, and thumbnails. The parent selects the wanted results, then starts those imports explicitly.
+
+### Trusted video sources
+
+Trusted sources poll a YouTube channel or playlist on a five-field UTC cron schedule. Each poll remembers the newest observed YouTube video ID and queues only unseen uploads. Duplicate checks also prevent a video already in the library or import queue from being added twice.
+
+Automatic approval is explicit per source. Enable it only when every upload from that channel is suitable for the children who receive it. A source can also import approved videos without assigning them, or assign each new video to selected child profiles with a chosen download priority. Pausing or deleting a source does not remove videos already imported.
 
 ### Members-only YouTube videos
 
@@ -113,6 +120,8 @@ Key endpoints:
 - `POST /imports/youtube/search`
 - `POST /imports/youtube/search/:id/import`
 - `POST /imports/youtube/url`
+- `CRUD /video-sources`
+- `POST /video-sources/:id/poll`
 - `GET /imports/:id`
 - `POST /imports/:id/cancel`
 - `GET /health`

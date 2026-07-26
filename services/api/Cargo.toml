@@ -10,6 +10,7 @@ aws-credential-types = "1"
 aws-sdk-s3 = "1"
 axum = { version = "0.7", features = ["multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.17"
 dotenvy = "0.15"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }

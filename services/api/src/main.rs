@@ -14,10 +14,12 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, Column, PgPool, Row};
-use tokio::{fs, process::Command};
+use std::str::FromStr;
+use tokio::{fs, process::Command, time};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::{OpenApi, ToSchema};
@@ -79,6 +81,11 @@ fn err(msg: impl Into<String>) -> ApiError {
         youtube_search,
         youtube_search_import,
         youtube_url,
+        list_video_sources,
+        create_video_source,
+        update_video_source,
+        delete_video_source,
+        poll_video_source_now,
         storage_summary,
         get_import,
         cancel_import,
@@ -87,7 +94,7 @@ fn err(msg: impl Into<String>) -> ApiError {
         update_category,
         delete_category
     ),
-    components(schemas(ChildInput, VideoInput, CategoryInput, AssignRequest))
+    components(schemas(ChildInput, VideoInput, CategoryInput, AssignRequest, VideoSourceInput))
 )]
 struct ApiDoc;
 
@@ -112,6 +119,16 @@ async fn main() -> anyhow::Result<()> {
         db,
         s3: build_storage().await?,
     };
+    let scheduler_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(error) = queue_due_video_sources(&scheduler_db).await {
+                tracing::error!("video source scheduler failed: {error}");
+            }
+        }
+    });
 
     let cors = CorsLayer::permissive();
 
@@ -147,6 +164,15 @@ async fn main() -> anyhow::Result<()> {
             post(youtube_search_import),
         )
         .route("/imports/youtube/url", post(youtube_url))
+        .route(
+            "/video-sources",
+            get(list_video_sources).post(create_video_source),
+        )
+        .route(
+            "/video-sources/:id",
+            put(update_video_source).delete(delete_video_source),
+        )
+        .route("/video-sources/:id/poll", post(poll_video_source_now))
         .route("/imports", get(list_imports))
         .route("/imports/:id", get(get_import).delete(delete_import))
         .route("/imports/:id/cancel", post(cancel_import))
@@ -962,6 +988,383 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+#[derive(Deserialize, ToSchema)]
+struct VideoSourceInput {
+    name: String,
+    source_url: String,
+    cron_schedule: String,
+    enabled: Option<bool>,
+    auto_approve: Option<bool>,
+    child_profile_ids: Option<Vec<Uuid>>,
+    download_priority: Option<String>,
+    max_videos_per_poll: Option<i32>,
+}
+
+fn normalized_cron_schedule(value: &str) -> ApiResult<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('@') {
+        Schedule::from_str(trimmed).map_err(|_| err("invalid cron schedule"))?;
+        return Ok(trimmed.to_owned());
+    }
+    if trimmed.split_whitespace().count() != 5 {
+        return Err(err(
+            "cron schedule must have five fields: minute hour day month weekday",
+        ));
+    }
+    let normalized = format!("0 {trimmed}");
+    Schedule::from_str(&normalized).map_err(|_| err("invalid cron schedule"))?;
+    Ok(trimmed.to_owned())
+}
+
+fn next_cron_occurrence(value: &str) -> ApiResult<DateTime<Utc>> {
+    let expression = if value.starts_with('@') {
+        value.to_owned()
+    } else {
+        format!("0 {value}")
+    };
+    Schedule::from_str(&expression)
+        .map_err(|_| err("invalid cron schedule"))?
+        .upcoming(Utc)
+        .next()
+        .ok_or_else(|| err("cron schedule has no future occurrence"))
+}
+
+fn is_youtube_source_url(value: &str) -> bool {
+    let Some(authority) = value.trim().strip_prefix("https://") else {
+        return false;
+    };
+    let authority = authority.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host == "youtubekids.com"
+        || host.ends_with(".youtubekids.com")
+}
+
+async fn validate_video_source_input(
+    db: &PgPool,
+    req: &VideoSourceInput,
+) -> ApiResult<(String, String, Vec<Uuid>, i32)> {
+    if req.name.trim().is_empty() {
+        return Err(err("source name is required"));
+    }
+    if !is_youtube_source_url(&req.source_url) {
+        return Err(err(
+            "a valid HTTPS YouTube channel or playlist URL is required",
+        ));
+    }
+    let cron_schedule = normalized_cron_schedule(&req.cron_schedule)?;
+    let priority = req
+        .download_priority
+        .clone()
+        .unwrap_or_else(|| "normal".into());
+    if !["required", "normal", "optional"].contains(&priority.as_str()) {
+        return Err(err("invalid download priority"));
+    }
+    let max_videos = req.max_videos_per_poll.unwrap_or(10);
+    if !(1..=50).contains(&max_videos) {
+        return Err(err("max videos per poll must be between 1 and 50"));
+    }
+    let child_ids = req
+        .child_profile_ids
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for child_id in &child_ids {
+        sqlx::query("SELECT id FROM child_profiles WHERE id=$1 AND is_active=true")
+            .bind(child_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|_| err("child lookup failed"))?
+            .ok_or_else(|| err("child profile not found"))?;
+    }
+    Ok((cron_schedule, priority, child_ids, max_videos))
+}
+
+async fn video_source_json(db: &PgPool, row: &sqlx::postgres::PgRow) -> ApiResult<Value> {
+    let mut source = row_to_json(row);
+    let source_id: Uuid = row.get("id");
+    let children = sqlx::query(
+        "SELECT cp.id, cp.name
+         FROM video_source_assignments vsa
+         JOIN child_profiles cp ON cp.id=vsa.child_profile_id
+         WHERE vsa.video_source_id=$1
+         ORDER BY cp.name",
+    )
+    .bind(source_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| err(e.to_string()))?;
+    if let Value::Object(ref mut map) = source {
+        map.insert(
+            "child_profile_ids".into(),
+            json!(children
+                .iter()
+                .map(|child| child.get::<Uuid, _>("id"))
+                .collect::<Vec<_>>()),
+        );
+        map.insert(
+            "child_names".into(),
+            json!(children
+                .iter()
+                .map(|child| child.get::<String, _>("name"))
+                .collect::<Vec<_>>()),
+        );
+    }
+    Ok(source)
+}
+
+#[utoipa::path(get, path = "/video-sources")]
+async fn list_video_sources(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let rows = sqlx::query("SELECT * FROM video_sources ORDER BY name")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        sources.push(video_source_json(&state.db, &row).await?);
+    }
+    Ok(Json(Value::Array(sources)))
+}
+
+#[utoipa::path(post, path = "/video-sources", request_body = VideoSourceInput)]
+async fn create_video_source(
+    State(state): State<AppState>,
+    Json(req): Json<VideoSourceInput>,
+) -> ApiResult<Json<Value>> {
+    let (cron_schedule, priority, child_ids, max_videos) =
+        validate_video_source_input(&state.db, &req).await?;
+    let mut tx = state.db.begin().await.map_err(|e| err(e.to_string()))?;
+    let row = sqlx::query(
+        "INSERT INTO video_sources
+         (name, source_url, cron_schedule, enabled, auto_approve, download_priority, max_videos_per_poll, next_poll_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+         RETURNING *",
+    )
+    .bind(req.name.trim())
+    .bind(req.source_url.trim())
+    .bind(cron_schedule)
+    .bind(req.enabled.unwrap_or(true))
+    .bind(req.auto_approve.unwrap_or(true))
+    .bind(priority)
+    .bind(max_videos)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        if error.to_string().contains("video_sources_provider_source_url_key") {
+            err("this YouTube source already exists")
+        } else {
+            err(error.to_string())
+        }
+    })?;
+    let id: Uuid = row.get("id");
+    for child_id in child_ids {
+        sqlx::query(
+            "INSERT INTO video_source_assignments (video_source_id, child_profile_id)
+             VALUES ($1,$2)",
+        )
+        .bind(id)
+        .bind(child_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    }
+    tx.commit().await.map_err(|e| err(e.to_string()))?;
+    audit(&state.db, "create", "video_source", Some(id), json!({})).await;
+    Ok(Json(video_source_json(&state.db, &row).await?))
+}
+
+#[utoipa::path(put, path = "/video-sources/{id}", request_body = VideoSourceInput)]
+async fn update_video_source(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<VideoSourceInput>,
+) -> ApiResult<Json<Value>> {
+    let (cron_schedule, priority, child_ids, max_videos) =
+        validate_video_source_input(&state.db, &req).await?;
+    let next_poll_at = next_cron_occurrence(&cron_schedule)?;
+    let mut tx = state.db.begin().await.map_err(|e| err(e.to_string()))?;
+    let row = sqlx::query(
+        "UPDATE video_sources
+         SET name=$1, source_url=$2, cron_schedule=$3, enabled=$4, auto_approve=$5,
+             download_priority=$6, max_videos_per_poll=$7, next_poll_at=$8,
+             updated_at=now()
+         WHERE id=$9
+         RETURNING *",
+    )
+    .bind(req.name.trim())
+    .bind(req.source_url.trim())
+    .bind(cron_schedule)
+    .bind(req.enabled.unwrap_or(true))
+    .bind(req.auto_approve.unwrap_or(true))
+    .bind(priority)
+    .bind(max_videos)
+    .bind(next_poll_at)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| err(e.to_string()))?
+    .ok_or_else(|| err("video source not found"))?;
+    sqlx::query("DELETE FROM video_source_assignments WHERE video_source_id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    for child_id in child_ids {
+        sqlx::query(
+            "INSERT INTO video_source_assignments (video_source_id, child_profile_id)
+             VALUES ($1,$2)",
+        )
+        .bind(id)
+        .bind(child_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    }
+    tx.commit().await.map_err(|e| err(e.to_string()))?;
+    audit(&state.db, "edit", "video_source", Some(id), json!({})).await;
+    Ok(Json(video_source_json(&state.db, &row).await?))
+}
+
+#[utoipa::path(delete, path = "/video-sources/{id}")]
+async fn delete_video_source(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let deleted = sqlx::query("DELETE FROM video_sources WHERE id=$1 RETURNING id")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| err("delete failed"))?;
+    if deleted.is_none() {
+        return Err(err("video source not found"));
+    }
+    audit(&state.db, "delete", "video_source", Some(id), json!({})).await;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[utoipa::path(post, path = "/video-sources/{id}/poll")]
+async fn poll_video_source_now(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let row = sqlx::query(
+        "UPDATE video_sources SET next_poll_at=now(), updated_at=now()
+         WHERE id=$1 AND enabled=true
+         RETURNING *",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| err("poll request failed"))?
+    .ok_or_else(|| err("enable the video source before polling"))?;
+    Ok(Json(video_source_json(&state.db, &row).await?))
+}
+
+async fn queue_due_video_sources(db: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let rows = sqlx::query(
+        "SELECT * FROM video_sources
+         WHERE enabled=true AND next_poll_at <= now()
+         ORDER BY next_poll_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT 20",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in rows {
+        let source_id: Uuid = row.get("id");
+        let cron_schedule: String = row.get("cron_schedule");
+        let Ok(next_poll_at) = next_cron_occurrence(&cron_schedule) else {
+            sqlx::query(
+                "UPDATE video_sources
+                 SET enabled=false, last_error='Invalid cron schedule', updated_at=now()
+                 WHERE id=$1",
+            )
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await?;
+            continue;
+        };
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM import_jobs
+               WHERE metadata->>'video_source_id'=$1
+                 AND metadata->>'import_kind'='source'
+                 AND status NOT IN ('completed','failed','cancelled')
+             )",
+        )
+        .bind(source_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !active {
+            let child_rows = sqlx::query(
+                "SELECT child_profile_id FROM video_source_assignments
+                 WHERE video_source_id=$1",
+            )
+            .bind(source_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let child_ids = child_rows
+                .iter()
+                .map(|child| child.get::<Uuid, _>("child_profile_id"))
+                .collect::<Vec<_>>();
+            let source_url: String = row.get("source_url");
+            let source_name: String = row.get("name");
+            let auto_approve: bool = row.get("auto_approve");
+            let download_priority: String = row.get("download_priority");
+            let max_videos: i32 = row.get("max_videos_per_poll");
+            let last_seen_external_id: Option<String> = row.get("last_seen_external_id");
+            sqlx::query(
+                "INSERT INTO import_jobs (provider, source_url, status, metadata)
+                 VALUES ('youtube',$1,'pending',$2)",
+            )
+            .bind(&source_url)
+            .bind(json!({
+                "import_kind": "source",
+                "video_source_id": source_id,
+                "video_source_name": source_name,
+                "source_last_seen_external_id": last_seen_external_id,
+                "max_videos": max_videos,
+                "child_profile_id": child_ids.first(),
+                "child_profile_ids": child_ids,
+                "approve": auto_approve,
+                "download_priority": download_priority,
+                "legal_notice": "Trusted source configured by the local administrator."
+            }))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE video_sources
+                 SET last_error=NULL, next_poll_at=$2, updated_at=now()
+                 WHERE id=$1",
+            )
+            .bind(source_id)
+            .bind(next_poll_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query("UPDATE video_sources SET next_poll_at=$2, updated_at=now() WHERE id=$1")
+                .bind(source_id)
+                .bind(next_poll_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await
+}
+
 #[derive(Deserialize)]
 struct YoutubeSearchInput {
     query: String,
@@ -1346,6 +1749,7 @@ struct WorkerAssetInput {
 #[derive(Deserialize)]
 struct PlaylistItemsInput {
     items: Vec<PlaylistItemInput>,
+    observed_external_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1371,6 +1775,27 @@ async fn worker_create_playlist_items(
         .map_err(|_| err("playlist import not found"))?;
     let parent_metadata: Value = parent.get("metadata");
     let result = create_import_jobs_from_items(&state, id, &parent_metadata, req.items).await?;
+    if let (Some(source_id), Some(observed_external_id)) = (
+        parent_metadata
+            .get("video_source_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok()),
+        req.observed_external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        sqlx::query(
+            "UPDATE video_sources
+             SET last_seen_external_id=$2, last_error=NULL, updated_at=now()
+             WHERE id=$1",
+        )
+        .bind(source_id)
+        .bind(observed_external_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    }
     Ok(Json(result))
 }
 
@@ -1466,6 +1891,14 @@ async fn worker_update_import(
     Path(id): Path<Uuid>,
     Json(req): Json<WorkerStatusInput>,
 ) -> ApiResult<Json<Value>> {
+    let video_source_id = req
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("video_source_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let source_error = req.error_message.clone();
+    let terminal_source_status = req.status.clone();
     let mut result_video_id = None;
     if req.status == "completed" && req.video.is_some() {
         let Some(video) = req.video else {
@@ -1529,6 +1962,22 @@ async fn worker_update_import(
     let row = sqlx::query("UPDATE import_jobs SET status=$1, progress=$2, error_message=$3, result_video_id=COALESCE($4,result_video_id), metadata=COALESCE($5,metadata), updated_at=now() WHERE id=$6 RETURNING *")
         .bind(req.status).bind(req.progress.unwrap_or(0)).bind(req.error_message).bind(result_video_id).bind(req.metadata).bind(id)
         .fetch_one(&state.db).await.map_err(|e| err(e.to_string()))?;
+    if let Some(source_id) = video_source_id {
+        if terminal_source_status == "failed" {
+            sqlx::query("UPDATE video_sources SET last_polled_at=now(), last_error=$2, updated_at=now() WHERE id=$1")
+                .bind(source_id)
+                .bind(source_error.unwrap_or_else(|| "Source poll failed".into()))
+                .execute(&state.db)
+                .await
+                .map_err(|e| err(e.to_string()))?;
+        } else if terminal_source_status == "completed" {
+            sqlx::query("UPDATE video_sources SET last_polled_at=now(), last_error=NULL, updated_at=now() WHERE id=$1")
+                .bind(source_id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| err(e.to_string()))?;
+        }
+    }
     Ok(Json(row_to_json(&row)))
 }
 
@@ -1622,4 +2071,39 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Value {
         map.insert(name.to_string(), value);
     }
     Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_standard_five_field_cron() {
+        assert_eq!(
+            normalized_cron_schedule("0 */6 * * *").unwrap(),
+            "0 */6 * * *"
+        );
+        assert!(next_cron_occurrence("0 */6 * * *").unwrap() > Utc::now());
+    }
+
+    #[test]
+    fn rejects_cron_with_wrong_field_count() {
+        assert!(normalized_cron_schedule("* * * *").is_err());
+        assert!(normalized_cron_schedule("* * * * * *").is_err());
+    }
+
+    #[test]
+    fn accepts_only_https_youtube_sources() {
+        assert!(is_youtube_source_url(
+            "https://www.youtube.com/@trusted/videos"
+        ));
+        assert!(is_youtube_source_url(
+            "https://youtube.com/playlist?list=trusted"
+        ));
+        assert!(!is_youtube_source_url(
+            "https://youtube.com@example.com/channel"
+        ));
+        assert!(!is_youtube_source_url("http://youtube.com/@trusted"));
+        assert!(!is_youtube_source_url("https://example.com/channel"));
+    }
 }

@@ -6,6 +6,7 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { execa } from "execa";
 import { nanoid } from "nanoid";
+import { selectSourceItems } from "./source-items.js";
 
 type ImportJob = {
   id: string;
@@ -485,8 +486,9 @@ async function processJob(job: ImportJob) {
   jobProgressFloor.delete(job.id);
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `happie-${job.id}-`));
   try {
-    if (metadataString(job, "import_kind") === "playlist") {
-      if (!job.source_url) throw new Error("playlist job has no source_url");
+    const importKind = metadataString(job, "import_kind");
+    if (importKind === "playlist" || importKind === "source") {
+      if (!job.source_url) throw new Error(`${importKind} job has no source_url`);
       job.status = "processing";
       const args = [
         "--js-runtimes", "node",
@@ -499,31 +501,55 @@ async function processJob(job: ImportJob) {
       }
       args.push(job.source_url);
       const { stdout } = await runTracked(job, 20, {
-        step: "Reading playlist",
-        detail: "yt-dlp is collecting the videos in this playlist",
+        step: importKind === "source" ? "Polling trusted source" : "Reading playlist",
+        detail: importKind === "source"
+          ? "yt-dlp is checking the source for new videos"
+          : "yt-dlp is collecting the videos in this playlist",
         source_url: job.source_url,
       }, "yt-dlp", args, 5 * 60_000);
       const playlist = JSON.parse(stdout);
       const entries = Array.isArray(playlist.entries) ? playlist.entries as PlaylistEntry[] : [];
-      const items = entriesToItems(entries);
-      if (items.length === 0) {
+      const sourceResult = importKind === "source"
+        ? selectSourceItems(
+          entriesToItems(entries),
+          metadataString(job, "source_last_seen_external_id"),
+          Math.min(50, Math.max(1, metadataNumber(job, "max_videos") ?? 10)),
+        )
+        : { items: entriesToItems(entries), observedExternalId: undefined };
+      const { items, observedExternalId } = sourceResult;
+      if (entries.length === 0 || (importKind !== "source" && items.length === 0)) {
         throw new Error("No importable videos were found in this playlist.");
+      }
+      if (importKind === "source" && items.length === 0) {
+        await update(job.id, {
+          status: "completed",
+          progress: 100,
+          metadata: mergeWorkerMetadata(job, {
+            step: "Source up to date",
+            detail: "No new videos found",
+            source_url: job.source_url,
+            files: { source_items: entries.length, queued_items: 0, skipped_duplicates: 0 },
+          }),
+        });
+        return;
       }
       await updateDiagnostics(job, 65, {
         step: "Creating video jobs",
-        detail: `${items.length} videos found`,
+        detail: importKind === "source"
+          ? `${items.length} new videos found`
+          : `${items.length} videos found`,
         source_url: job.source_url,
         files: { playlist_items: items.length },
       });
       const result = await api<{ created_count: number; skipped_duplicates: number }>(`/worker/imports/${job.id}/playlist-items`, {
         method: "POST",
-        body: JSON.stringify({ items }),
+        body: JSON.stringify({ items, observed_external_id: observedExternalId }),
       });
       await update(job.id, {
         status: "completed",
         progress: 100,
         metadata: mergeWorkerMetadata(job, {
-          step: "Playlist queued",
+          step: importKind === "source" ? "Source poll complete" : "Playlist queued",
           detail: `${result.created_count} video imports created, ${result.skipped_duplicates} already in library`,
           source_url: job.source_url,
           files: { playlist_items: items.length, queued_items: result.created_count, skipped_duplicates: result.skipped_duplicates },

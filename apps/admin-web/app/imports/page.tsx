@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ExternalLink, RotateCcw, Search, Trash2, XCircle } from "lucide-react";
+import { ExternalLink, Radio, RotateCcw, Search, Trash2, XCircle } from "lucide-react";
 import { Shell } from "@/components/shell";
 import { Badge, Button, Panel, ProgressBar } from "@/components/ui";
 import { api, ImportJob } from "@/lib/api";
@@ -118,6 +118,9 @@ export default function ImportsPage() {
       <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div><h1 className="page-title">Imports</h1><p className="page-subtitle">YouTube imports are user-supplied content jobs.</p></div>
         <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+          <Button asChild variant="secondary" className="w-full sm:w-auto">
+            <Link href="/imports/sources"><Radio size={16} /> Trusted sources</Link>
+          </Button>
           <Button variant="secondary" className="w-full sm:w-auto" onClick={retryAllFailed} disabled={failedJobCount === 0 || isRetryingFailed}>
             <RotateCcw size={16} /> {isRetryingFailed ? "Retrying failed jobs" : `Retry all failed${failedJobCount ? ` (${failedJobCount})` : ""}`}
           </Button>
