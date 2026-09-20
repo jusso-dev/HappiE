@@ -556,6 +556,7 @@ async function processJob(job: ImportJob) {
       "--js-runtimes", "node", "--remote-components", "ejs:github",
       "--no-playlist", "--newline", "--progress-delta", "2",
       "--concurrent-fragments", String(downloadFragments),
+      "--http-chunk-size", "10M",
       "--max-filesize", `${maxMb}M`, "-f", youtubeFormat,
       "--merge-output-format", "mkv", "--remux-video", "mkv",
       "-o", sourcePath, videoUrl,
