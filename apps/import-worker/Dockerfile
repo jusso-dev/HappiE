@@ -1,6 +1,6 @@
 FROM node:22-bookworm AS base
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip curl ca-certificates && rm -rf /var/lib/apt/lists/* \
-  && python3 -m pip install --break-system-packages yt-dlp
+  && python3 -m pip install --break-system-packages yt-dlp==2026.8.19
 WORKDIR /app/apps/import-worker
 COPY apps/import-worker/package*.json ./
 RUN npm install

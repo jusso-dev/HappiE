@@ -2,6 +2,7 @@ import { createReadStream, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { createJobUpdates } from "./job-updates.js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { execa } from "execa";
@@ -69,7 +70,7 @@ const audioBitrate = process.env.OPTIMIZED_AUDIO_BITRATE || "96k";
 const bucket = process.env.R2_BUCKET || "happie";
 const workerToken = process.env.IMPORT_WORKER_TOKEN;
 const ytdlpCookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
-const streamedYoutubeFormat = "b[height<=720][ext=mp4][vcodec!=none][acodec!=none][protocol=https]/b[height<=720][vcodec!=none][acodec!=none][protocol=https]";
+const youtubeFormat = `bv[height<=${videoMaxHeight}][ext=mp4][vcodec^=avc1]+ba[ext=m4a]/bv[height<=${videoMaxHeight}]+ba/b[height<=${videoMaxHeight}]`;
 
 const s3 = new S3Client({
   region: "auto",
@@ -226,32 +227,17 @@ async function api<T>(pathName: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (workerToken) headers.set("X-Worker-Token", workerToken);
-  const res = await fetch(`${apiBase}${pathName}`, { ...init, headers });
+  const res = await fetch(`${apiBase}${pathName}`, { ...init, headers, signal: init.signal ?? AbortSignal.timeout(30_000) });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
 }
 
-// Concurrent diagnostic updates (transcode + thumbnail) report different progress
-// values for the same job; without a floor the reported percent jumps backwards.
-const jobProgressFloor = new Map<string, number>();
-
-function monotonicProgress(id: string, progress: number) {
-  const next = Math.max(jobProgressFloor.get(id) ?? 0, Math.min(100, Math.round(progress)));
-  jobProgressFloor.set(id, next);
-  return next;
-}
-
-async function update(id: string, body: Record<string, unknown>) {
-  if (typeof body.progress === "number") {
-    body = { ...body, progress: monotonicProgress(id, body.progress) };
-  }
-  await api(`/worker/imports/${id}/status`, { method: "POST", body: JSON.stringify(body) });
-  if (body.status === "completed" || body.status === "failed" || body.status === "cancelled") {
-    jobProgressFloor.delete(id);
-  }
-}
+const jobUpdates = createJobUpdates((id, body) =>
+  api(`/worker/imports/${id}/status`, { method: "POST", body: JSON.stringify(body) }));
+const update = jobUpdates.update;
 
 async function updateDiagnostics(job: ImportJob, progress: number, diagnostics: Diagnostics) {
+  if (job.status === "failed" || job.status === "completed" || job.status === "cancelled") return;
   job.metadata = mergeWorkerMetadata(job, diagnostics);
   await update(job.id, { status: job.status || "processing", progress, metadata: job.metadata });
 }
@@ -342,7 +328,7 @@ async function inspectYoutubeMedia(job: ImportJob, videoUrl: string): Promise<Yo
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
     "--no-playlist",
-    "-f", streamedYoutubeFormat,
+    "-f", youtubeFormat,
     "--dump-single-json",
     videoUrl,
   ], 120_000);
@@ -364,11 +350,11 @@ function parseFfmpegTimeSeconds(text: string): number | undefined {
 const TRANSCODE_PROGRESS_START = 52;
 const TRANSCODE_PROGRESS_END = 74;
 
-async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string, key: string, sourceInfo: YoutubeMediaInfo) {
+async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string, key: string, sourceInfo: YoutubeMediaInfo, sourcePath: string) {
   const output: string[] = [];
   const diagnostics = {
     step: "Streaming iPad MP4",
-    detail: "yt-dlp is piping source media through FFmpeg directly into object storage",
+    detail: "FFmpeg is converting downloaded source directly into object storage",
     source_url: job.source_url,
     normalized_url: videoUrl,
     files: { width: sourceInfo.width, height: sourceInfo.height },
@@ -377,21 +363,9 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
   const startedAt = now();
   await updateDiagnostics(job, TRANSCODE_PROGRESS_START, { ...diagnostics, last_output: output });
 
-  const downloader = execa("yt-dlp", withYtDlpAuth([
-    "--js-runtimes", "node",
-    "--remote-components", "ejs:github",
-    "--no-playlist",
-    "--concurrent-fragments", String(downloadFragments),
-    "--max-filesize", `${maxMb}M`,
-    "-f", streamedYoutubeFormat,
-    "-o", "-",
-    videoUrl,
-  // The media stream is consumed by FFmpeg below. Do not also buffer it in
-  // execa, which otherwise terminates imports once stdout exceeds 100 MB.
-  ]), { timeout: 30 * 60_000, stdout: "pipe", buffer: false });
   const ffmpeg = execa("ffmpeg", [
     "-y",
-    "-i", "pipe:0",
+    "-i", sourcePath,
     "-map", "0:v:0",
     "-map", "0:a:0?",
     "-vf", `scale=if(gt(ih\\,${videoMaxHeight})\\,-2\\,iw):if(gt(ih\\,${videoMaxHeight})\\,${videoMaxHeight}\\,ih)`,
@@ -425,10 +399,8 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
       timings: { elapsed_seconds: secondsSince(startedAt) },
     }).catch(() => {});
   };
-  downloader.stderr?.on("data", trackTranscode);
   ffmpeg.stderr?.on("data", trackTranscode);
 
-  downloader.stdout?.pipe(ffmpeg.stdin!);
   let fileSizeBytes = 0;
   const counter = new Transform({
     transform(chunk, _encoding, callback) {
@@ -436,7 +408,7 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
       callback(null, chunk);
     },
   });
-  const upload = new Upload({
+  const uploader = new Upload({
     client: s3,
     params: {
       Bucket: bucket,
@@ -447,43 +419,23 @@ async function streamYoutubeTranscodeToStorage(job: ImportJob, videoUrl: string,
     queueSize: 2,
     partSize: 8 * 1024 * 1024,
     leavePartsOnError: false,
-  }).done();
-
-  await Promise.all([downloader, ffmpeg, upload]);
+  });
+  const upload = uploader.done();
+  try {
+    await Promise.all([ffmpeg, upload]);
+  } catch (error) {
+    ffmpeg.kill("SIGKILL");
+    counter.destroy();
+    await uploader.abort().catch(() => {});
+    await Promise.allSettled([ffmpeg, upload]);
+    throw new Error(sanitizeDiagnosticText(`${error instanceof Error ? error.message : error}\n${output.join("\n")}`));
+  }
   if (fileSizeBytes > maxMb * 1024 * 1024) throw new Error("optimized file exceeds size limit");
   return { fileSizeBytes, info: scaledDimensions(sourceInfo) };
 }
 
-async function createPosterFromYoutubeStream(job: ImportJob, videoUrl: string, thumbPath: string, sourceInfo: YoutubeMediaInfo) {
-  const output: string[] = [];
-  const diagnostics = {
-    step: "Creating thumbnail",
-    detail: "yt-dlp is piping source media through FFmpeg for a poster frame",
-    source_url: job.source_url,
-    normalized_url: videoUrl,
-    files: { width: sourceInfo.width, height: sourceInfo.height },
-  };
-  const startedAt = now();
-  await updateDiagnostics(job, 68, { ...diagnostics, last_output: output });
-  const downloader = execa("yt-dlp", withYtDlpAuth([
-    "--js-runtimes", "node",
-    "--remote-components", "ejs:github",
-    "--no-playlist",
-    "--concurrent-fragments", String(downloadFragments),
-    "--max-filesize", `${maxMb}M`,
-    "-f", streamedYoutubeFormat,
-    "-o", "-",
-    videoUrl,
-  ]), { timeout: 120_000, stdout: "pipe", buffer: false });
-  const ffmpeg = execa("ffmpeg", ["-y", "-ss", "00:00:00.5", "-i", "pipe:0", "-frames:v", "1", thumbPath], { timeout: 120_000, stdin: "pipe", buffer: false });
-  attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, downloader);
-  attachTrackedErrorOutput(job, 68, diagnostics, output, startedAt, ffmpeg);
-  downloader.stdout?.pipe(ffmpeg.stdin!);
-  await Promise.all([downloader, ffmpeg]);
-}
-
 async function processJob(job: ImportJob) {
-  jobProgressFloor.delete(job.id);
+  jobUpdates.reset(job.id);
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), `happie-${job.id}-`));
   try {
     const importKind = metadataString(job, "import_kind");
@@ -609,12 +561,28 @@ async function processJob(job: ImportJob) {
       }),
     });
     const sourceInfo = await inspectYoutubeMedia(job, videoUrl);
+    const sourcePath = path.join(workDir, "source.mkv");
+    await runTracked(job, 30, {
+      step: "Downloading source",
+      detail: "Downloading separate video and audio streams before conversion",
+      source_url: job.source_url,
+    }, "yt-dlp", [
+      "--js-runtimes", "node", "--remote-components", "ejs:github",
+      "--no-playlist", "--newline", "--progress-delta", "2",
+      "--concurrent-fragments", String(downloadFragments),
+      "--max-filesize", `${maxMb}M`, "-f", youtubeFormat,
+      "--merge-output-format", "mkv", "--remux-video", "mkv",
+      "-o", sourcePath, videoUrl,
+    ], 30 * 60_000);
+    if ((await fs.stat(sourcePath)).size > maxMb * 1024 * 1024) {
+      throw new Error("source file exceeds size limit");
+    }
     if (!sourceInfo.width || !sourceInfo.height) {
       throw new Error("YouTube did not provide a downloadable video stream for this URL.");
     }
     await updateDiagnostics(job, 40, {
       step: "Source ready",
-      detail: "Source media will be streamed directly into iPad processing",
+      detail: "Source downloaded and ready for iPad processing",
       files: { width: sourceInfo.width, height: sourceInfo.height, duration_seconds: sourceInfo.duration_seconds },
     });
 
@@ -638,8 +606,8 @@ async function processJob(job: ImportJob) {
       "-o", path.join(workDir, "youtube-thumbnail.%(ext)s"),
       videoUrl,
     ], 120_000).catch(() => undefined);
-    const { fileSizeBytes: mp4Size, info } = await streamYoutubeTranscodeToStorage(job, videoUrl, mp4Key, sourceInfo);
-    await thumbnailImport;
+    const { fileSizeBytes: mp4Size, info } = await streamYoutubeTranscodeToStorage(job, videoUrl, mp4Key, sourceInfo, sourcePath)
+      .finally(() => thumbnailImport);
     const thumbnailFiles = await fs.readdir(workDir);
     const importedThumb = thumbnailFiles.find(isImportedThumbnail);
     if (importedThumb) {
@@ -650,7 +618,9 @@ async function processJob(job: ImportJob) {
         files: { ipad_mp4_mb: sizeMb(mp4Size) },
       });
     } else {
-      await createPosterFromYoutubeStream(job, videoUrl, thumbPath, sourceInfo);
+      await runTracked(job, 75, { step: "Creating thumbnail" }, "ffmpeg", [
+        "-y", "-ss", "00:00:00.5", "-i", sourcePath, "-frames:v", "1", thumbPath,
+      ], 120_000);
     }
     const thumbStat = await fs.stat(thumbPath);
 
@@ -691,6 +661,7 @@ async function processJob(job: ImportJob) {
       }),
     });
   } catch (error) {
+    job.status = "failed";
     const errorMessage = sanitizeDiagnosticText(error instanceof Error ? error.message : String(error));
     await update(job.id, {
       status: "failed",
@@ -700,8 +671,11 @@ async function processJob(job: ImportJob) {
         step: "Failed",
         detail: errorMessage,
       }),
-    }).catch(() => {});
+    }).catch((updateError) => {
+      console.error(`Failed to record import failure for ${job.id}`, updateError);
+    });
   } finally {
+    jobUpdates.reset(job.id);
     await fs.rm(workDir, { recursive: true, force: true });
   }
 }
