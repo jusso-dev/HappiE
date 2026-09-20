@@ -288,20 +288,6 @@ function attachTrackedOutput(
   });
 }
 
-function attachTrackedErrorOutput(
-  job: ImportJob,
-  progress: number,
-  diagnostics: Diagnostics,
-  output: string[],
-  startedAt: number,
-  subprocess: ReturnType<typeof execa>,
-) {
-  subprocess.stderr?.on("data", (chunk) => {
-    rememberOutput(output, chunk);
-    void updateDiagnostics(job, progress, { ...diagnostics, last_output: output, timings: { elapsed_seconds: secondsSince(startedAt) } }).catch(() => {});
-  });
-}
-
 async function uploadFile(localPath: string, key: string, contentType: string) {
   await s3.send(new PutObjectCommand({
     Bucket: bucket,
