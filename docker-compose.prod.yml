@@ -95,7 +95,7 @@ services:
     environment:
       HAPPIE_API_URL: http://happie-api:8080
     ports:
-      - "127.0.0.1:${MCP_PORT:-18081}:3001"
+      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_PORT:-18081}:3001"
 
   import-worker:
     image: ghcr.io/jusso-dev/happie-import-worker:latest
