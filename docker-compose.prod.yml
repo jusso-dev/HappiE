@@ -85,6 +85,18 @@ services:
     ports:
       - "0.0.0.0:5500:3000"
 
+  happie-mcp:
+    image: ghcr.io/jusso-dev/happie-mcp:latest
+    restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    depends_on:
+      - happie-api
+    environment:
+      HAPPIE_API_URL: http://happie-api:8080
+    ports:
+      - "127.0.0.1:${MCP_PORT:-18081}:3001"
+
   import-worker:
     image: ghcr.io/jusso-dev/happie-import-worker:latest
     restart: unless-stopped

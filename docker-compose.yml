@@ -83,6 +83,15 @@ services:
       - ./apps/admin-web:/app/apps/admin-web
       - admin-node-modules:/app/apps/admin-web/node_modules
 
+  happie-mcp:
+    build:
+      context: .
+      dockerfile: apps/mcp/Dockerfile
+    depends_on:
+      - happie-api
+    ports:
+      - "127.0.0.1:${MCP_PORT:-18081}:3001"
+
   import-worker:
     build:
       context: .

@@ -1,0 +1,44 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { createHttpServer } from './index.js';
+
+test('MCP tools route validated requests and propagate API errors', async (t) => {
+  const calls = [];
+  const api = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    calls.push({ method: req.method, path: req.url, body: Buffer.concat(chunks).toString(), type: req.headers['content-type'] });
+    res.writeHead(req.url === '/imports/e9e2f095-6130-4d08-9aae-185010966d43' ? 400 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(req.url === '/children' ? [{ name: 'Example' }] : { ok: true }));
+  }).listen(0, '127.0.0.1');
+  await once(api, 'listening');
+  const mcp = createHttpServer(`http://127.0.0.1:${api.address().port}`).listen(0, '127.0.0.1');
+  await once(mcp, 'listening');
+  const url = new URL(`http://127.0.0.1:${mcp.address().port}/mcp`);
+  const client = new Client({ name: 'test', version: '1' });
+  t.after(async () => { await client.close(); mcp.closeAllConnections(); api.closeAllConnections(); mcp.close(); api.close(); });
+  await client.connect(new StreamableHTTPClientTransport(url));
+  const tools = await client.listTools();
+  assert.equal(tools.tools.length, 32);
+  assert.ok(tools.tools.some((tool) => tool.name === 'upload_video'));
+  const result = await client.callTool({ name: 'list_children', arguments: {} });
+  assert.match(result.content[0].text, /Example/);
+  const childId = 'e9e2f095-6130-4d08-9aae-185010966d43';
+  await client.callTool({ name: 'update_child', arguments: { id: childId, name: 'Ada' } });
+  assert.equal(calls.at(-1).path, `/children/${childId}`);
+  assert.deepEqual(JSON.parse(calls.at(-1).body), { name: 'Ada' });
+  const failed = await client.callTool({ name: 'get_import', arguments: { id: childId } });
+  assert.equal(failed.isError, true);
+  const invalid = await client.callTool({ name: 'delete_child', arguments: { id: '../bad' } });
+  assert.equal(invalid.isError, true);
+  await client.callTool({ name: 'upload_video', arguments: { title: 'Clip', filename: 'clip.mp4', content_base64: 'YWJj' } });
+  assert.equal(calls.at(-1).path, '/uploads/direct');
+  assert.match(calls.at(-1).type, /multipart\/form-data/);
+  assert.match(calls.at(-1).body, /abc/);
+  const blocked = await fetch(url, { method: 'POST', headers: { Origin: 'http://evil.example' } });
+  assert.equal(blocked.status, 403);
+});

@@ -12,11 +12,12 @@ MinIO console:
 
 ## Homelab deployment (pull-based)
 
-Pushing to `main` triggers `.github/workflows/build-push.yml`, which builds and pushes three amd64 images to GHCR:
+Pushing to `main` triggers `.github/workflows/build-push.yml`, which builds and pushes four amd64 images to GHCR:
 
 - `ghcr.io/jusso-dev/happie-api`
 - `ghcr.io/jusso-dev/happie-admin-web`
 - `ghcr.io/jusso-dev/happie-import-worker`
+- `ghcr.io/jusso-dev/happie-mcp`
 
 Each is tagged `latest` and with the commit SHA.
 
@@ -36,9 +37,13 @@ docker compose -f docker-compose.prod.yml up -d
 
 ### Updates
 
-Watchtower runs inside the stack, polls GHCR every 5 minutes (override with `WATCHTOWER_INTERVAL_SECONDS`), and pulls + restarts only the three Happie services (label-scoped, so Postgres/MinIO are never touched). Push to `main`, wait for the workflow, and the homelab updates itself. To force an immediate update:
+Watchtower runs inside the stack, polls GHCR every 5 minutes (override with `WATCHTOWER_INTERVAL_SECONDS`), and pulls + restarts only the labelled Happie services (so Postgres/MinIO are never touched). When adding a service or changing Compose, copy the updated Compose file to the host and run Compose there. Push to `main`, wait for the workflow, and the homelab updates itself. To force an immediate update:
 
 ```sh
-docker compose -f docker-compose.prod.yml pull happie-api admin-web import-worker
+docker compose -f docker-compose.prod.yml pull happie-api admin-web import-worker happie-mcp
 docker compose -f docker-compose.prod.yml up -d
 ```
+
+### MCP access
+
+The stateless Streamable HTTP endpoint is `http://127.0.0.1:18081/mcp` on the homelab host. It has full administrative access and no application authentication; Compose binds it to host loopback only. For a client on another machine, create an SSH tunnel with `ssh -N -L 18081:127.0.0.1:18081 homelab` and connect to `http://127.0.0.1:18081/mcp` on that machine. Do not expose it publicly or change the binding without adding a trusted authentication layer. Tools cover child profiles, videos and uploads, assignments, imports, YouTube searches and scheduled sources, categories, and storage. Uploads accept base64 content, require substantial client and server memory, and are limited to a 256 MiB JSON request (roughly 192 MiB of file data); `MCP_MAX_REQUEST_BYTES` can override that limit in the MCP service environment. Search is asynchronous: call `youtube_search`, then `get_import` until results are available, then `import_search_results`.

@@ -25,6 +25,9 @@ jobs:
           - image: happie-import-worker
             dockerfile: apps/import-worker/Dockerfile
             target: prod
+          - image: happie-mcp
+            dockerfile: apps/mcp/Dockerfile
+            target: ""
     steps:
       - uses: actions/checkout@v4
 
